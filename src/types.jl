@@ -12,12 +12,12 @@ struct tdsTypeDAQmxRawData <: TDMSUnimplementedType end
 
 abstract type TDMSType end
 struct TimeStamp <: TDMSType
-    seconds::Int
-    fractions::UInt
+    seconds::Int64
+    fractions::UInt64
 end
 const epoch=TimeDate(1904,1,1)
 function TimeDate(x::TimeStamp)
-    ns = round(x.fractions*(2.0^-64),digits=9)
+    ns = round(x.fractions*(2.0^-64)*1e9)
     epoch + Second(x.seconds) + Nanosecond(ns)
 end
 function Base.:+(x::T,y::T) where {T<:TimeStamp}
@@ -36,7 +36,7 @@ Base.show(ts::TimeStamp) = show(TimeDate(ts))
 
 function Base.:read(s::IO, ::Type{TimeStamp})
     fractions=read(s,UInt64)
-    seconds=read(s, Int)
+    seconds=read(s, Int64)
     TimeStamp(seconds,fractions)
 end
 
