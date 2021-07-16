@@ -71,6 +71,7 @@ struct Channel{T}
     props::OrderedDict{String,Any}
 
     Channel{T}() where {T} = new(Vector{T}(),OrderedDict{String,Any}())
+    Channel{T}(props) where {T} = new(Vector{T}(),props) #already have props 
 end
 ==(a::TDMSReader.Channel,b::TDMSReader.Channel) = (a.props == b.props) && (a.data == b.data)
 
@@ -134,4 +135,13 @@ function Base.:getindex(g::Group, channel::Union{Integer,AbstractString})
     else
         g.channels[channel]
     end
+end
+
+struct SegInfo
+    position::Int64
+    toc::ToC
+    nextsegmentposition::Int64
+    rawdataposition::Int64
+    nobj::Int64
+    rawdatasize::Int64
 end
