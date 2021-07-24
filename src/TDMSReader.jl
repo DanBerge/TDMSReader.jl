@@ -32,6 +32,41 @@ function readtdms(fn::AbstractString)
     f
 end
 
+function readseginfo(fn::AbstractString)
+    #STILL COULD USE SOME WORK HERE TO MAKE IT CLEAN AND NEAT
+    s = open(fn)
+    f=File()
+    objdict=ObjDict()
+    tdmsSeg = OrderedDict()
+    lead_size = 28 #lead in is 28 bytes
+    segCnt = 0
+    while !eof(s)
+        startPos = position(s)
+        (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
+        if toc.kTocNewObjList
+            empty!(objdict.current)
+        end
+
+        nobj = read(s, UInt32)
+        seek(s,startPos+lead_size)
+        if toc.kTocMetaData
+            readmetadata!(f, objdict, s)
+        end
+        if toc.kTocRawData
+            #readrawdata!(objdict, nextsegmentoffset-rawdataoffset, s)
+        end
+        nextsegmentPos = Int64(startPos+nextsegmentoffset+lead_size)
+        dataPos = Int64(startPos+lead_size+rawdataoffset)
+        rawdatasize = nextsegmentoffset-rawdataoffset
+        tdmsTmp = SegInfo(startPos,toc,nextsegmentPos,dataPos,nobj,rawdatasize)
+        segCnt +=1
+        tdmsSeg[string("seg",segCnt)] = tdmsTmp
+        seek(s,nextsegmentPos)
+    end
+    close(s)
+    return f,objdict,tdmsSeg
+end
+
 function readleadin(s::IO)
     @assert ntoh(read(s, UInt32)) == 0x54_44_53_6D
     toc=ToC(ltoh(read(s, UInt32)))
@@ -92,10 +127,13 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
             hasrawdata && throw(ErrorException("TDMS Group should not have raw data"))
             readprop!(g.props,s)
         else # Is  a Channel
-            chan=if haskey(g.channels,channel)
-                g[channel]
+            if haskey(g.channels,channel)
+                if hasnewchunk && eltype(g[channel].data)==Nothing #need to replace existing channel if created without having data
+                    setindex!(g.channels,TDMSReader.Channel{T}(g[channel].props),channel) #convert existing channel
+                end
+                chan = g[channel]
             else
-                if hasrawdata
+                chan=if hasrawdata
                     get!(g.channels, channel, TDMSReader.Channel{T}())
                 else
                     get!(g.channels, channel, TDMSReader.Channel{Nothing}())
