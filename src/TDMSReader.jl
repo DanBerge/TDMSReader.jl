@@ -5,9 +5,9 @@ import DataStructures: OrderedDict
 
 include("types.jl")
 
-const _example_tdms=(@__DIR__) * "\\..\\test\\example_files\\reference_file.tdms"
-const _example_incremental=[(@__DIR__) * "\\..\\test\\example_files\\incremental_test_$i.tdms" for i=1:6]
-const _example_DAQmx=(@__DIR__) * "\\..\\test\\example_files\\DAQmx example.tdms"
+const _example_tdms=joinpath(@__DIR__, "..", "test", "example_files","reference_file.tdms")
+const _example_incremental=[joinpath(@__DIR__, "..","test","example_files","incremental_test_$i.tdms") for i=1:6]
+const _example_DAQmx=joinpath(@__DIR__,"..","test","example_files","DAQmx example.tdms")
 
 export readtdms
 
