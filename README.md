@@ -93,8 +93,8 @@ its own.
 
 Since September 2026 this package has been written with Claude Code (Claude Fable
 5.1, then Claude Opus 5.5) assisting: about two thirds of the source and most of
-the tests (by `git blame` on 17 October 2026, 610 of the 910 lines in `src/` and
-592 of the 706 in `test/`). Dan Berge wrote the original reader in 2019, with
+the tests (by `git blame` on 17 October 2026, 612 of the 890 lines in `src/` and
+782 of the 896 in `test/`). Dan Berge wrote the original reader in 2019, with
 fixes from jaakkor2, rs7q5 and Nicolas Brantut. The real captures it is checked on
 are mine. The commits Claude contributed to carry a `Co-Authored-By: Claude`
 trailer. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md).
