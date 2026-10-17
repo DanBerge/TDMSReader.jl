@@ -151,11 +151,45 @@ function Base.:getindex(g::Group, channel::Union{Integer,AbstractString})
     end
 end
 
-struct SegInfo
-    position::Int64
-    toc::ToC
-    nextsegmentposition::Int64
-    rawdataposition::Int64
-    nobj::Int64
-    rawdatasize::Int64
+"""
+One run of a channel's raw values on disk: `nvalues` values starting at byte
+`offset`, `stride` bytes apart (the element size when the chunk is contiguous,
+the row size when it is interleaved).
+"""
+struct Run
+    offset::Int64
+    nvalues::Int64
+    stride::Int64
 end
+
+"What `tdmsinfo` knows about one channel without reading its data."
+struct ChannelInfo
+    eltype::DataType
+    nsamples::Int64
+    props::OrderedDict{String,Any}
+    runs::Vector{Run}
+    starts::Vector{Int64}        # 1-based sample index at which each run begins
+end
+
+"""
+`tdmsinfo(path)`: the `File` (properties, groups, channels -- with EMPTY data
+vectors) plus, per `(group, channel)`, a `ChannelInfo` giving the element type,
+the sample count the file actually holds, and where its values live. Index it
+like a `File`: `info["Group", "Channel1"]` or `info[1, 1]`.
+"""
+struct TDMSInfo
+    path::String
+    file::File
+    channels::OrderedDict{Tuple{String,String},ChannelInfo}
+end
+Base.keys(i::TDMSInfo) = keys(i.channels)
+Base.getindex(i::TDMSInfo, group::AbstractString, channel::AbstractString) = i.channels[(String(group), String(channel))]
+function Base.getindex(i::TDMSInfo, group::Integer, channel::Integer)
+    g = collect(keys(i.file.groups))[group]
+    c = collect(keys(i.file.groups[g].channels))[channel]
+    i.channels[(g, c)]
+end
+Base.getindex(i::TDMSInfo, group::AbstractString, channel::Integer) =
+    i.channels[(String(group), collect(keys(i.file.groups[group].channels))[channel])]
+Base.getindex(i::TDMSInfo, group::Integer, channel::AbstractString) =
+    i.channels[(collect(keys(i.file.groups))[group], String(channel))]
