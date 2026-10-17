@@ -252,13 +252,17 @@ end
 # A minimal TDMS 2.0 writer, after NI's "TDMS File Format Internal Structure": the
 # 28-byte lead-in, meta data (object paths, raw data indexes, properties), then the raw
 # data. Objects are (path, T, nvalues, props); T === nothing: no raw data; nvalues ===
-# :same: the layout of the last segment. T may be a TDMS type code. A property value is
-# a string, or (type code, bytes). `newobj = false` carries the last segment's object
-# list over; `closed = false` writes the all-ones offset of a file that was never closed.
+# :same: the layout of the last segment. T may be a TDMS type code. For T === String,
+# nvalues is the strings of one chunk, or (count, total bytes) to declare any other size.
+# A property value is a string, or (type code, bytes). `newobj = false` carries the last
+# segment's object list over; `closed = false` writes the all-ones offset of a file that
+# was never closed.
 tdms_str(s) = vcat(collect(reinterpret(UInt8, [UInt32(ncodeunits(s))])), codeunits(s))
 tdms_code(T::Unsigned) = UInt32(T)
 tdms_code(T) = T === Int16 ? UInt32(0x02) : T === Int32 ? UInt32(0x03) : T === Float64 ? UInt32(0x0A) :
-               T === TDMSReader.TimeStamp ? UInt32(0x44) : error("no TDMS code for $T here")
+               T === TDMSReader.TimeStamp ? UInt32(0x44) : T === String ? UInt32(0x20) : error("no TDMS code for $T here")
+# A chunk of strings as TDMS stores it: each string's end offset in the text (UInt32), then the text.
+tdms_strings(xs) = vcat(collect(reinterpret(UInt8, UInt32.(cumsum(ncodeunits.(xs))))), codeunits.(xs)...)
 function tdms_segment(io, objs, raw::AbstractVector{UInt8}; interleaved = false, newobj = true, version = 4713, closed = true)
     meta = IOBuffer()
     write(meta, UInt32(length(objs)))
@@ -266,6 +270,9 @@ function tdms_segment(io, objs, raw::AbstractVector{UInt8}; interleaved = false,
         write(meta, tdms_str(path))
         if T === nothing; write(meta, 0xFFFFFFFF)
         elseif n === :same; write(meta, UInt32(0))
+        elseif T === String                 # a string's index adds the chunk's total bytes
+            k, total = n isa Tuple ? n : (length(n), length(tdms_strings(n)))
+            write(meta, UInt32(28), tdms_code(T), UInt32(1), UInt64(k), UInt64(total))
         else write(meta, UInt32(20), tdms_code(T), UInt32(1), UInt64(n)) end
         write(meta, UInt32(length(props)))
         for (k, v) in props
@@ -585,4 +592,115 @@ end
     @test (@allocated try readtdms(p) catch end) < 2^26           # not the 4 GiB the length claims
     @test occursin("unknown TDMS data type", sprint(showerror, try readtdms(damaged(49:52, 0x003e0020)) catch e; e end))
     @test occursin("values per chunk", sprint(showerror, try readtdms(damaged(57:64, typemax(UInt64))) catch e; e end))
+end
+
+# ---------------------------------------------------------------------------
+# String channels. TDMS stores a chunk of n strings as n UInt32 offsets, each the end of
+# one string in the text that follows them; the raw data index gives the chunk's total
+# bytes, offsets and text, after the value count. The values expected are those written.
+# ---------------------------------------------------------------------------
+f64(xs...) = collect(reinterpret(UInt8, Float64[xs...]))
+
+@testset "string channels read beside numeric ones, whole and on demand" begin
+    p = joinpath(mktempdir(), "strings.tdms")
+    s1, s2 = ["ab", "c"], ["d", "ef"]          # two chunks of one segment: the size its index declares
+    s3 = ["", "µs", "日本語", "long "^20, ""]
+    s4 = reverse(s3)                           # the same size again: written with the last layout
+    open(p, "w") do io
+        tdms_segment(io, [("/'G'", nothing, 0, ["prop" => "v"]), ("/'G'/'i'", Int32, 2, []),
+                          ("/'G'/'s'", String, s1, ["unit_string" => "text"]), ("/'G'/'f'", Float64, 1, [])],
+                     vcat(i32(1, 2), tdms_strings(s1), f64(0.5), i32(3, 4), tdms_strings(s2), f64(1.5)))
+        # a new index for the strings alone; the other channels carry over
+        tdms_segment(io, [("/'G'/'s'", String, s3, [])], vcat(i32(5, 6), tdms_strings(s3), f64(2.5)); newobj = false)
+        # the strings pause, then resume with their last layout
+        tdms_segment(io, [("/'G'/'s'", nothing, 0, [])], vcat(i32(7, 8), f64(3.5)); newobj = false)
+        tdms_segment(io, [("/'G'/'s'", String, :same, [])], vcat(i32(9, 10), tdms_strings(s4), f64(4.5)); newobj = false)
+    end
+    want = vcat(s1, s2, s3, s4); n = length(want)
+    f = readtdms(p)
+    @test f["G", "s"].data == want && eltype(f["G", "s"].data) == String
+    @test f["G", "i"].data == Int32[1:10;] && f["G", "f"].data == [0.5, 1.5, 2.5, 3.5, 4.5]
+    @test f["G", "s"].props["unit_string"] == "text" && f["G"].props["prop"] == "v"
+    info = tdmsinfo(p)
+    @test info["G", "s"].eltype == String && info["G", "s"].nsamples == n
+    @test all(tdmsread(info, "G", "s", a:b) == want[a:b] for a in 1:n for b in a-1:n)
+    for bs in 1:4
+        got = String[]; offs = Int[]
+        @test tdmsblocks((x, off) -> (push!(offs, off); append!(got, x)), info, "G", "s"; blocksize = bs) == n
+        @test got == want && offs == 0:bs:n-1
+    end
+    @test tdmsread(info, "G", "i", 1:10) == Int32[1:10;] && tdmsread(info, "G", "f", 2:5) == [1.5, 2.5, 3.5, 4.5]
+    # what readtdms allocates: the numbers, and for each string its text, a pointer and a length
+    @test TDMSReader.databytes(info) == 10 * 4 + 5 * 8 + sum(ncodeunits, want) + 16n
+end
+
+@testset "a lone string channel flagged interleaved reads as contiguous; beside others it is refused" begin
+    dir = mktempdir()
+    xs = ["abcdefg", "qwertyuiop"]
+    p = joinpath(dir, "lone.tdms")             # npTDMS issue #239: some writers flag such a segment interleaved
+    open(io -> tdms_segment(io, [("/'G'/'s'", String, xs, [])], tdms_strings(xs); interleaved = true), p, "w")
+    @test readtdms(p)["G", "s"].data == xs && tdmsread(p, "G", "s", 1:2) == xs
+    q = joinpath(dir, "mixed.tdms")            # a string has no fixed size, so it cannot share a row
+    open(io -> tdms_segment(io, [("/'G'/'i'", Int32, 2, []), ("/'G'/'s'", String, xs, [])],
+                            vcat(i32(1, 2), tdms_strings(xs)); interleaved = true), q, "w")
+    for rd in (readtdms, tdmsinfo)
+        @test occursin("interleaved", sprint(showerror, try rd(q) catch e; e end))
+    end
+end
+
+@testset "a cut-off segment holding strings gives its whole chunks, and nothing of the last" begin
+    dir = mktempdir()
+    a, b, c = ["one", "two"], ["six", "ten"], ["abc", "xyz"]      # chunks of 8 + 8 + 6 bytes
+    objs = [("/'G'/'i'", Int32, 2, []), ("/'G'/'s'", String, a, [])]
+    whole = vcat(i32(1, 2), tdms_strings(a), i32(3, 4), tdms_strings(b), i32(5, 6), tdms_strings(c))
+    @test length(whole) == 66
+    # never closed, and cut off inside the third chunk: in i's values, in the offsets, in the text
+    for k in (48, 56, 62)
+        p = joinpath(dir, "cut$k.tdms"); open(io -> tdms_segment(io, objs, whole[1:k]; closed = false), p, "w")
+        f, info = readtdms(p), tdmsinfo(p)
+        @test f["G", "s"].data == vcat(a, b) && f["G", "i"].data == Int32[1:4;]
+        @test info["G", "s"].nsamples == 4 && info["G", "i"].nsamples == 4
+        @test tdmsread(info, "G", "s", 1:4) == vcat(a, b) && tdmsread(info, "G", "i", 1:4) == Int32[1:4;]
+    end
+    # closed, with bytes left over that are not a whole chunk: the same, not shared in proportion
+    q = joinpath(dir, "remainder.tdms"); open(io -> tdms_segment(io, objs, whole[1:56]), q, "w")
+    @test readtdms(q)["G", "s"].data == vcat(a, b) && readtdms(q)["G", "i"].data == Int32[1:4;]
+    @test tdmsinfo(q)["G", "i"].nsamples == 4
+    # cut off inside the first chunk: nothing (npTDMS's test_incomplete_segment_with_string_data)
+    r = joinpath(dir, "first.tdms"); open(io -> tdms_segment(io, objs, whole[1:12]; closed = false), r, "w")
+    f = readtdms(r)
+    @test isempty(f["G", "s"].data) && isempty(f["G", "i"].data) && tdmsinfo(r)["G", "s"].nsamples == 0
+end
+
+@testset "string offsets that disagree with the declared size are refused" begin
+    dir = mktempdir()
+    seg(path, n, raw) = (open(io -> tdms_segment(io, [("/'G'/'s'", String, n, [])], raw), path, "w"); path)
+    xs = ["abc", "de"]
+    # the index declares a byte more than the offsets account for
+    p = seg(joinpath(dir, "size.tdms"), (2, 14), vcat(tdms_strings(xs), [0x00]))
+    # offsets that run backwards
+    q = seg(joinpath(dir, "backwards.tdms"), (2, 10), vcat(collect(reinterpret(UInt8, UInt32[3, 2])), codeunits("ab")))
+    # a last offset a byte past the text, at the end of the file (as in the file of npTDMS's
+    # test_as_hdf_string, which npTDMS reads only because a read past the end stops short)
+    o = seg(joinpath(dir, "past.tdms"), (2, 13), vcat(collect(reinterpret(UInt8, UInt32[3, 6])), codeunits("abcde")))
+    for path in (p, q, o)
+        @test occursin("damaged", sprint(showerror, try readtdms(path) catch e; e end))
+        @test occursin("damaged", sprint(showerror, try tdmsread(path, "G", "s", 1:2) catch e; e end))
+    end
+    # fewer bytes than the offsets alone take
+    r = seg(joinpath(dir, "short.tdms"), (2, 7), zeros(UInt8, 7))
+    @test occursin("damaged", sprint(showerror, try readtdms(r) catch e; e end))
+end
+
+@testset "strings are kept byte for byte, and a memory budget cannot size a buffer of them" begin
+    p = joinpath(mktempdir(), "bytes.tdms")
+    xs = [String(UInt8[0x30, 0x20, 0xb0]), "ok"]             # the first is not valid UTF-8
+    open(io -> tdms_segment(io, [("/'G'/'s'", String, xs, [])], tdms_strings(xs)), p, "w")
+    got = readtdms(p)["G", "s"].data
+    @test codeunits(got[1]) == UInt8[0x30, 0x20, 0xb0] && !isvalid(got[1]) && got[2] == "ok"
+    @test tdmsread(p, "G", "s", 1:1) == xs[1:1]
+    @test_throws ArgumentError tdmsblocks((x, _) -> nothing, p, "G", "s"; memory = 1000)
+    need = TDMSReader.databytes(tdmsinfo(p))
+    @test_throws ErrorException readtdms(p; memory = need - 1)
+    @test readtdms(p; memory = need)["G", "s"].data == xs
 end

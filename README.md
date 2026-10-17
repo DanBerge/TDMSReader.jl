@@ -32,16 +32,21 @@ end
 ```
 
 `tdmsread` and `tdmsblocks` also accept the path in place of `info`. `tdmsblocks`
-takes `memory`, a byte budget for its buffer, as well as `blocksize`.
-`TDMSReader.databytes(info)` is the number of bytes `readtdms` would allocate.
+takes `memory`, a byte budget for its buffer, as well as `blocksize`; strings have
+no fixed size, so a string channel takes `blocksize` only.
+`TDMSReader.databytes(info)` is the number of bytes `readtdms` would allocate
+(for a string, its text and 16 bytes more, as `Base.summarysize` counts it).
 
 ## What it reads
 
 - TDMS 1.0 and 2.0 files (versions 4712 and 4713), little-endian
-- numeric (including "with unit" floats), complex, Boolean and TimeStamp channels
+- numeric (including "with unit" floats), complex, Boolean, TimeStamp and string
+  channels; a string is kept byte for byte, even where it is not valid UTF-8
+  (`isvalid` tells; npTDMS replaces such bytes with U+FFFD)
 - contiguous and interleaved raw data, several chunks per segment, and meta data
   that changes from segment to segment, including channels that hold no data in
-  some segments
+  some segments; a string channel alone in a segment flagged interleaved is read
+  as contiguous, as npTDMS reads it
 - group and channel names holding quotes, slashes or any Unicode
 - files that were never closed (the application stopped mid-write), whose last
   chunk may be partial; a file that ends inside a segment's lead-in or meta data
@@ -50,8 +55,11 @@ takes `memory`, a byte budget for its buffer, as well as `blocksize`.
 A short final chunk in a segment the writer closed is read as every channel with
 fewer values, in proportion; in a segment cut short, the values stop where the
 file does. NI's format description does not cover the first case; npTDMS reads
-it the same way.
+it the same way. A segment holding a string channel is the exception: strings
+have no fixed size, so its short final chunk is not divided, and gives no values
+in any channel (npTDMS does the same).
 
-Refused with an error rather than misread: big-endian files, DAQmx raw data,
-string channels, interleaved channels of different lengths, and versions other
-than 4712 and 4713.
+Refused with an error rather than misread: big-endian files, DAQmx raw data, a
+string channel interleaved with other channels, string offsets that disagree
+with the size their raw data index declares, interleaved channels of different
+lengths, and versions other than 4712 and 4713.

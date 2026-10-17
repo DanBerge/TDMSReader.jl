@@ -14,9 +14,16 @@ export tdmsinfo, tdmsread, tdmsblocks
 
 readtdms() = readtdms(_example_tdms)
 
-"Bytes of channel data the file holds -- what `readtdms` would allocate."
-databytes(info::TDMSInfo) = sum((ci.eltype === Nothing ? 0 : ci.nsamples * sizeof(ci.eltype)
-                                 for ci in values(info.channels)); init = 0)
+"""
+Bytes the channel data takes in memory -- what `readtdms` would allocate: each value's
+size, and for a string its text and 16 bytes more, the pointer to it and its length, as
+`Base.summarysize` counts it.
+"""
+databytes(info::TDMSInfo) = sum((valuebytes(ci) for ci in values(info.channels)); init = 0)
+valuebytes(ci::ChannelInfo) =
+    ci.eltype === Nothing ? 0 :
+    ci.eltype === String ? sum((r.stride - 4r.nvalues for r in ci.runs); init = 0) + 16ci.nsamples :
+    ci.nsamples * sizeof(ci.eltype)
 
 """
     readtdms(fn; memory = Sys.free_memory()) -> File
@@ -177,48 +184,58 @@ end
 Record where the values of the current segment's channels sit, chunk after chunk,
 by the same rules `readrawdata!` reads them: contiguous layout gives each channel
 one run per chunk; interleaved layout gives each channel one strided run over the
-whole rows the segment holds. A partial final chunk yields whole values only. A
+whole rows the segment holds. A short final chunk is divided as `chunkplan` says. A
 run that continues the channel's previous one on disk (one channel written in
-many chunks) extends it, so it is read in one piece.
+many chunks) extends it, so it is read in one piece. A chunk of strings is a run of
+its own, since its offsets count from its own text.
 """
 function locateruns!(runs, objdict::ObjDict, datapos::Integer, nbytes::Integer, interleaved::Bool, incomplete::Bool)
-    # each channel's run list, element size and chunk length, looked up once per segment;
-    # a channel the segment lists as having no raw data takes no part in it
-    chans = [(get!(() -> Run[], runs, path), sizeof(eltype(c.data)), Int(c.nsamples)) for (path, c) in objdict.current if c.nsamples > 0]
+    # each channel's run list, value size (0 for a string, which has none), chunk length and
+    # chunk bytes, looked up once per segment; a channel the segment lists as having no raw
+    # data takes no part in it. Typed, so that the loops below do not box each tuple.
+    chans = Tuple{Vector{Run},Int,Int,Int}[(get!(() -> Run[], runs, path), c isa Chunk{String} ? 0 : sizeof(eltype(c.data)),
+                                            Int(c.nsamples), Int(c.nbytes)) for (path, c) in objdict.current if c.nsamples > 0]
     isempty(chans) && return
-    if interleaved
-        checkinterleaved([n for (_, _, n) in chans])
-        rowbytes = sum(esz for (_, esz, _) in chans)
+    if readinterleaved(interleaved, length(chans), any(t -> t[2] == 0, chans))
+        checkinterleaved([n for (_, _, n, _) in chans])
+        rowbytes = sum(esz for (_, esz, _, _) in chans)
         rows = nbytes ÷ rowbytes
         off = 0
-        for (v, esz, _) in chans
+        for (v, esz, _, _) in chans
             rows > 0 && addrun!(v, Run(datapos + off, rows, rowbytes))
             off += esz
         end
     else
-        nchunks, last = chunkplan([esz for (_, esz, _) in chans], [n for (_, _, n) in chans], nbytes, incomplete)
+        nchunks, last = chunkplan([b for (_, _, _, b) in chans], [n for (_, _, n, _) in chans], nbytes, incomplete;
+                                  sized = all(t -> t[2] > 0, chans))
         at = Int(datapos)
-        for k in 1:nchunks + 1, (i, (v, esz, nsamples)) in enumerate(chans)
-            n = k <= nchunks ? nsamples : last[i]
-            n > 0 && addrun!(v, Run(at, n, esz))
-            at += n * esz
+        for _ in 1:nchunks, (v, esz, n, b) in chans
+            esz == 0 ? push!(v, Run(at, n, b)) : addrun!(v, Run(at, n, esz))
+            at += b
+        end
+        for ((v, esz, _, _), m) in zip(chans, last)  # a short final chunk: never a string's
+            m > 0 && addrun!(v, Run(at, m, esz))
+            at += m * esz
         end
     end
 end
 
 """
 How the raw data of a contiguous segment divides between its channels: `nchunks` whole
-chunks, each holding every channel's `counts[i]` values in turn, then a short final chunk
-of `last[i]` values per channel. NI's format description does not say what a short final
-chunk holds. In a segment the writer closed, it is read as every channel with fewer values,
-in proportion (the reading npTDMS gives such files). In an `incomplete` segment, one the
-writer never finished, the values stop where the file does: channels in layout order, and
-nothing after the first channel that is cut short.
+chunks, each holding every channel's `counts[i]` values (`bytes[i]` bytes) in turn, then a
+short final chunk of `last[i]` values per channel. NI's format description does not say
+what a short final chunk holds. In a segment the writer closed, it is read as every channel
+with fewer values, in proportion (the reading npTDMS gives such files). In an `incomplete`
+segment, one the writer never finished, the values stop where the file does: channels in
+layout order, and nothing after the first channel that is cut short. Unless every value
+has a fixed size (`sized`), a short final chunk gives nothing: a string chunk cut short
+cannot be divided, nor can anything laid out after it (npTDMS does not read it either).
 """
-function chunkplan(sizes::Vector{Int}, counts::Vector{Int}, nbytes::Integer, incomplete::Bool)
-    chunk = sum(Int128.(sizes) .* counts)
+function chunkplan(bytes::Vector{Int}, counts::Vector{Int}, nbytes::Integer, incomplete::Bool; sized::Bool = true)
+    chunk = sum(Int128, bytes)
     nchunks, rem = Int.(divrem(Int128(nbytes), chunk))
     last = zeros(Int, length(counts))
+    sized || return nchunks, last
     if !incomplete
         for i in eachindex(counts)
             last[i] = Int(div(widemul(counts[i], rem), chunk))
@@ -226,8 +243,9 @@ function chunkplan(sizes::Vector{Int}, counts::Vector{Int}, nbytes::Integer, inc
     else
         left = rem
         for i in eachindex(counts)
-            last[i] = min(counts[i], left ÷ sizes[i])
-            left -= last[i] * sizes[i]
+            size = bytes[i] ÷ counts[i]
+            last[i] = min(counts[i], left ÷ size)
+            left -= last[i] * size
             last[i] < counts[i] && break
         end
     end
@@ -277,7 +295,8 @@ Call `f(x, offset)` for consecutive blocks of one channel, `offset` being the
 0-based index of the block's first sample. One buffer is reused between calls;
 the last block is short, never padded. `memory` is a byte budget for that buffer
 (`blocksize` is then at most `memory ÷ sizeof(eltype)`); a budget too small for a
-single value is an `ArgumentError`.
+single value is an `ArgumentError`, and so is a budget for a string channel, whose
+values have no fixed size.
 """
 function tdmsblocks(f::Function, x::Union{AbstractString,TDMSInfo}, group, channel;
                     blocksize::Integer = 2^20, memory::Union{Nothing,Integer} = nothing)
@@ -285,6 +304,8 @@ function tdmsblocks(f::Function, x::Union{AbstractString,TDMSInfo}, group, chann
     ci = info[group, channel]
     ci.nsamples == 0 && return 0
     if memory !== nothing
+        ci.eltype === String && throw(ArgumentError("a memory budget cannot size a buffer of strings, " *
+                                                    "whose lengths vary; give blocksize instead"))
         cap = Int(memory) ÷ sizeof(ci.eltype)
         cap >= 1 || throw(ArgumentError("memory budget of $memory bytes holds no $(ci.eltype) value"))
         blocksize = min(blocksize, cap)
@@ -338,6 +359,37 @@ function readrange!(out::AbstractVector{T}, at::Integer, s::IO, ci::ChannelInfo,
     out
 end
 
+"""
+The same for strings, each run a chunk: of each chunk, read the end offsets of the strings
+wanted and of the one before them, the chunk's last offset (which must match the size its
+index declares), and the text between.
+"""
+function readrange!(out::AbstractVector{String}, at::Integer, s::IO, ci::ChannelInfo, first::Integer, n::Integer)
+    k = searchsortedlast(ci.starts, first)
+    while n > 0 && k <= length(ci.runs)
+        run = ci.runs[k]; skip = first - ci.starts[k]
+        take = min(n, run.nvalues - skip)
+        textbytes = run.stride - 4run.nvalues
+        moveto!(s, run.offset + 4max(skip - 1, 0))
+        ends = Vector{UInt32}(undef, take + (skip > 0))
+        read!(s, ends)
+        lo = skip > 0 ? Int(popfirst!(ends)) : 0
+        if skip + take < run.nvalues
+            moveto!(s, run.offset + 4(run.nvalues - 1))
+            final = read(s, UInt32)
+        else
+            final = ends[end]
+        end
+        checkstrings(ends, lo, final, textbytes, run.offset)
+        moveto!(s, run.offset + 4run.nvalues + lo)
+        text = read(s, ends[end] - lo)
+        length(text) == ends[end] - lo || throw(EOFError())
+        splitstrings!(out, at - 1, ends, lo, text)
+        first += take; at += take; n -= take; k += 1
+    end
+    out
+end
+
 function readleadin(s::IO)
     at = position(s)
     tag = read(s, 4)
@@ -369,7 +421,7 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
         # the object list, but holds no values here
         if haskey(objdict.current, objpath)
             c = objdict.current[objpath]
-            objdict.current[objpath] = Chunk{eltype(c.data)}(c.data, zero(UInt64))
+            objdict.current[objpath] = Chunk{eltype(c.data)}(c.data, zero(UInt64), zero(UInt64))
         end
     elseif rawdata==zero(UInt32) #Keep Chunk layout
         haskey(objdict.full, objpath) || throw(ErrorException("Previous Segment Missing"))
@@ -388,7 +440,12 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
         # 2^56 values of 16 bytes or less: more than any file holds, and safe to multiply
         n <= 1 << 56 || throw(ErrorException("TDMS channel $objpath declares $n values per chunk; the file is damaged"))
         if T == String
-            throw(ErrorException("Need Functionality to Read String as raw data"))
+            # a string has no fixed size: its index adds the chunk's total bytes, offsets and text
+            nbytes = read(s, UInt64)
+            (n == 0 ? nbytes == 0 : 4n <= nbytes <= 1 << 62) ||
+                throw(ErrorException("TDMS string channel $objpath declares $nbytes bytes for $n strings; the file is damaged"))
+        else
+            nbytes = n * sizeof(T)
         end
     end
 
@@ -429,7 +486,7 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
 
     if hasrawdata
         if hasnewchunk
-            objdict.full[objpath]=Chunk{T}(chan.data,n)
+            objdict.full[objpath]=Chunk{T}(chan.data,n,nbytes)
         end
         objdict.current[objpath]=objdict.full[objpath]
     end
@@ -482,15 +539,16 @@ end
 Read `nbytes` of raw data for the channels in `objdict.current`, chunk after chunk.
 Contiguous layout: each chunk holds every channel's `nsamples` values one channel
 after another. Interleaved layout (`kTocInterleavedData`): each chunk holds
-`nsamples` rows of one value per channel. A final chunk that the file cuts short
-yields as many whole values as it holds, in layout order, and no more.
+`nsamples` rows of one value per channel. A short final chunk is divided as
+`chunkplan` says.
 """
 function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, incomplete::Bool, s::IO)
     # a channel the segment lists as having no raw data takes no part in it
     chans = [c for c in values(objdict.current) if c.nsamples > 0]
     isempty(chans) && return nothing
     left = Int(nbytes)
-    if interleaved
+    hasstring = any(c -> c isa Chunk{String}, chans)
+    if readinterleaved(interleaved, length(chans), hasstring)
         # Whole rows only, read in blocks of at most 16 MiB and split per channel.
         checkinterleaved([Int(c.nsamples) for c in chans])
         rowbytes = sum(sizeof(eltype(c.data)) for c in chans)
@@ -508,16 +566,80 @@ function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, inco
             done += k
         end
     else
-        counts = [Int(c.nsamples) for c in chans]
-        nchunks, last = chunkplan([sizeof(eltype(c.data)) for c in chans], counts, left, incomplete)
-        for _ in 1:nchunks, (c, n) in zip(chans, counts)
-            readchunk!(c.data, n, s)
+        nchunks, last = chunkplan([Int(c.nbytes) for c in chans], [Int(c.nsamples) for c in chans], left, incomplete;
+                                  sized = !hasstring)
+        for _ in 1:nchunks, c in chans
+            readchunk!(c, s)
         end
-        for (c, n) in zip(chans, last)
-            readchunk!(c.data, n, s)
+        for (c, n) in zip(chans, last)               # a short final chunk: never a string's
+            n > 0 && readchunk!(c.data, n, s)
         end
     end
     return nothing
+end
+
+"""
+Whether the raw data of a segment of `nchannels` channels is read as interleaved rows. A
+string has no fixed size, so it cannot share a row with other values: a segment flagged
+interleaved that holds a string channel among others is refused, as npTDMS refuses it. A
+string channel on its own is read as contiguous, as npTDMS reads it; some writers flag
+such a segment interleaved.
+"""
+function readinterleaved(flag::Bool, nchannels::Int, hasstring::Bool)
+    (flag && hasstring) || return flag
+    nchannels == 1 && return false
+    throw(ErrorException("TDMS interleaved segment holds a string channel among others; " *
+                         "a string has no fixed size, so its rows cannot be split"))
+end
+
+"Append one whole chunk of the channel's values."
+readchunk!(c::Chunk, s::IO) = readchunk!(c.data, Int(c.nsamples), s)
+readchunk!(c::Chunk{String}, s::IO) = readstrings!(c.data, Int(c.nsamples), Int(c.nbytes), s)
+
+"""
+Append a chunk of `n` strings, `nbytes` bytes in all, to `v`: `n` UInt32 offsets, each the
+end of one string in the text that follows them.
+"""
+function readstrings!(v::Vector{String}, n::Int, nbytes::Int, s::IO)
+    pos = position(s)
+    ends = Vector{UInt32}(undef, n)
+    read!(s, ends)
+    textbytes = nbytes - 4n
+    checkstrings(ends, 0, ends[end], textbytes, pos)
+    text = read(s, textbytes)
+    length(text) == textbytes || throw(EOFError())
+    m = length(v)
+    resize!(v, m + n)
+    splitstrings!(v, m, ends, 0, text)
+end
+
+"""
+Refuse a chunk of strings (at byte `pos`) whose offsets do not fit the size its index
+declares: its last offset, `final`, must be `textbytes`, the size of its text, and the
+offsets `ends` read from it may not run backwards from `lo`, where the first of them starts.
+"""
+function checkstrings(ends::Vector{UInt32}, lo::Integer, final::Integer, textbytes::Integer, pos::Integer)
+    ok = final == textbytes
+    prev = lo
+    for e in ends
+        ok = ok && prev <= e <= textbytes
+        prev = e
+    end
+    ok || throw(ErrorException("TDMS string chunk at byte $pos: its offsets run backwards, or do not end at " *
+                               "the $textbytes bytes of text its index declares; the file is damaged"))
+end
+
+"""
+Put the strings that end at offsets `ends` into `out[at+1:at+length(ends)]`. The first
+starts at offset `lo`; `text` holds the chunk's text from offset `lo` on.
+"""
+function splitstrings!(out::AbstractVector{String}, at::Integer, ends::Vector{UInt32}, lo::Integer, text::Vector{UInt8})
+    prev = Int(lo)
+    for (i, e) in enumerate(ends)
+        out[at + i] = String(text[prev - lo + 1:e - lo])
+        prev = Int(e)
+    end
+    out
 end
 
 "Append `k` values of `T` to `v`, `stride` bytes apart in `buf` from byte offset `off`."
