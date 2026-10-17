@@ -704,3 +704,193 @@ end
     @test_throws ErrorException readtdms(p; memory = need - 1)
     @test readtdms(p; memory = need)["G", "s"].data == xs
 end
+
+# ---------------------------------------------------------------------------
+# What no test above ran (found by a coverage run): TimeStamp properties, conversion and
+# arithmetic; a channel that is listed before it is given any data; indexing info by
+# name and number together; haskey and getkey on files and groups.
+# ---------------------------------------------------------------------------
+@testset "TimeStamp properties, conversion and arithmetic" begin
+    TS, TD = TDMSReader.TimeStamp, TDMSReader.TimeDate
+    ts = TS(3744278548, 0x8000000000000000)
+    p = joinpath(mktempdir(), "timestamp_props.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/", nothing, 0, ["created" => (0x44, tdms_bytes(ts))]),
+                          ("/'G'/'c'", Int32, 2, ["wf_start_time" => (0x44, tdms_bytes(TS(1, 0))), "unit_string" => "V"])],
+                     i32(1, 2))
+    end
+    f = readtdms(p)
+    @test f.props["created"] === ts
+    @test f["G", "c"].props["wf_start_time"] === TS(1, 0) && f["G", "c"].props["unit_string"] == "V"
+    @test f["G", "c"].data == Int32[1, 2]
+    @test tdmsinfo(p)["G", "c"].props["wf_start_time"] === TS(1, 0)
+    # whole seconds since 1904-01-01, and fractions of 2^-64 s
+    @test TD(TS(0, 0)) == TD(1904, 1, 1)
+    @test TD(TS(86400, 0)) == TD(1904, 1, 2)
+    @test TD(TS(-1, 0)) == TD(1903, 12, 31, 23, 59, 59)
+    @test TD(TS(0, 0x8000000000000000)) == TD(1904, 1, 1) + TDMSReader.Nanosecond(500_000_000)
+    # sums and differences carry between the fractions and the seconds
+    a, b = TS(1, 0xC000000000000000), TS(2, 0x8000000000000000)          # 1.75 s and 2.5 s
+    @test a + b === TS(4, 0x4000000000000000)
+    @test b - a === TS(0, 0xC000000000000000)
+    @test (a + b) - b === a
+    @test sprint(show, ts) == sprint(show, TD(ts))
+end
+
+@testset "a channel listed before it has data takes the type of its first data" begin
+    p = joinpath(mktempdir(), "late.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/'G'/'c'", nothing, 0, ["unit_string" => "V"]), ("/'G'/'d'", Int32, 1, [])], i32(7))
+        tdms_segment(io, [("/'G'/'c'", Float64, 2, ["more" => "x"]), ("/'G'/'d'", Int32, 1, [])], vcat(f64(0.5, 1.5), i32(8)))
+    end
+    f = readtdms(p)
+    @test eltype(f["G", "c"].data) == Float64 && f["G", "c"].data == [0.5, 1.5]
+    @test f["G", "c"].props["unit_string"] == "V" && f["G", "c"].props["more"] == "x"
+    @test collect(keys(f["G"])) == ["c", "d"] && f["G", "d"].data == Int32[7, 8]
+    info = tdmsinfo(p)
+    @test info["G", "c"].eltype == Float64 && tdmsread(info, "G", "c", 1:2) == [0.5, 1.5]
+end
+
+@testset "info indexed by name and number together; haskey and getkey on files and groups" begin
+    p = joinpath(mktempdir(), "keys.tdms")
+    open(io -> tdms_segment(io, [("/'G'/'a'", Int32, 1, []), ("/'G'/'b'", Int32, 1, []), ("/'H'/'c'", Int32, 1, [])],
+                            i32(1, 2, 3)), p, "w")
+    f, info = readtdms(p), tdmsinfo(p)
+    @test info["G", 2] === info[1, "b"] === info[1, 2] === info["G", "b"]
+    @test info["H", 1] === info[2, "c"] === info["H", "c"]
+    @test haskey(f, "G") && !haskey(f, "nope") && haskey(f["G"], "b") && !haskey(f["G"], "c")
+    # getkey is Base's: the key if there is one, else the default
+    @test getkey(f, "H", nothing) == "H" && getkey(f, "nope", :none) === :none
+    @test getkey(f["G"], "a", nothing) == "a" && getkey(f["G"], "c", :none) === :none
+end
+
+# ---------------------------------------------------------------------------
+# Damaged files at random. Files of each kind tested above are damaged many times over:
+# bytes changed, extreme values written over 4- and 8-byte fields and over the first
+# lead-in, the file cut short. The damage is the same on every run. A damaged file must
+# be read or refused with an ErrorException or EOFError: never another error, nor an
+# allocation of what a damaged field claims. Where it is read, tdmsinfo, tdmsread and
+# tdmsblocks must give the values readtdms gives. (The npTDMS comparison harness runs
+# the same at length on npTDMS's files.)
+# ---------------------------------------------------------------------------
+mutable struct XorShift; s::UInt64; end      # not Random: the same stream on every Julia version
+next!(r::XorShift) = (x = r.s; x ⊻= x << 13; x ⊻= x >> 7; x ⊻= x << 17; r.s = x)
+pick(r::XorShift, n::Integer) = Int(next!(r) % UInt64(n)) + 1
+const EXTREMES = UInt64[0, 1, 0xFF, 0xFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x0000000100000000,
+                        typemax(Int64), typemax(UInt64)]
+
+function damage(r::XorShift, b::Vector{UInt8})
+    c = copy(b); kind = pick(r, 5)
+    if kind == 1                                   # a few bytes changed
+        for _ in 1:pick(r, 4); c[pick(r, length(c))] = next!(r) % UInt8; end
+    elseif kind == 2                               # an extreme UInt32 anywhere
+        i = pick(r, length(c) - 3); c[i:i+3] = reinterpret(UInt8, [EXTREMES[pick(r, end)] % UInt32])
+    elseif kind == 3                               # an extreme UInt64 anywhere
+        i = pick(r, length(c) - 7); c[i:i+7] = reinterpret(UInt8, [EXTREMES[pick(r, end)]])
+    elseif kind == 4                               # the first lead-in's ToC, version or offsets
+        i = (5, 9, 13, 21)[pick(r, 4)]; w = i >= 13 ? 8 : 4
+        c[i:i+w-1] = reinterpret(UInt8, [EXTREMES[pick(r, end)]])[1:w]
+    else                                           # cut short
+        resize!(c, pick(r, length(c)) - 1)
+    end
+    c, kind
+end
+
+"What `f(path)` returns, or the exception it throws; warnings about cut-off files are not printed."
+quietread(f, path) = try
+    Base.CoreLogging.with_logger(() -> f(path), Base.CoreLogging.NullLogger())
+catch e
+    e
+end
+
+"""
+Damage `b` `times` times, read each with every reader, and add what goes wrong to `bad`.
+The damaged files are all written to `dir` before any is read: on Windows, a file in the
+temporary folder read back just after it was rewritten took about 10 ms (most likely the
+virus scanner), and well under 1 ms when the files were all written first.
+"""
+function damagedreads!(bad::Vector{String}, name, b::Vector{UInt8}, r::XorShift, times::Int, dir)
+    damaged = [damage(r, b) for _ in 1:times]
+    paths = [joinpath(dir, "damaged$k.tdms") for k in 1:times]
+    foreach(write, paths, first.(damaged))
+    for (k, (path, (_, kind))) in enumerate(zip(paths, damaged))
+        at = "$name, damage $k (kind $kind)"
+        t = @timed quietread(p -> readtdms(p; memory = 2^24), path)
+        f = t.value
+        t.bytes < 2^26 || push!(bad, "$at: readtdms allocated $(t.bytes >> 20) MiB")
+        if f isa Exception
+            f isa ErrorException || f isa EOFError ||
+                push!(bad, "$at: readtdms threw $(typeof(f)): $(first(sprint(showerror, f), 120))")
+            continue
+        end
+        info = quietread(tdmsinfo, path)
+        if info isa Exception
+            push!(bad, "$at: readtdms read it, tdmsinfo threw $(typeof(info))"); continue
+        end
+        for (g, grp) in f.groups, (ch, chn) in grp.channels
+            v = chn.data; n = length(v)
+            info[g, ch].nsamples == n || push!(bad, "$at: $g/$ch has $(info[g, ch].nsamples) samples on demand, $n read")
+            (eltype(v) === Nothing || n == 0) && continue
+            a = pick(r, n); z = a - 1 + pick(r, n - a + 1)
+            got = eltype(v)[]
+            try
+                isequal(tdmsread(info, g, ch, a:z), v[a:z]) || push!(bad, "$at: $g/$ch tdmsread($a:$z) differs")
+                tdmsblocks((x, _) -> append!(got, x), info, g, ch; blocksize = pick(r, 3))
+                isequal(got, v) || push!(bad, "$at: $g/$ch tdmsblocks differs")
+            catch e
+                push!(bad, "$at: $g/$ch read whole, but on demand threw $(typeof(e)): $(first(sprint(showerror, e), 120))")
+            end
+        end
+    end
+    bad
+end
+
+@testset "damaged files are read or refused, and read on demand as read whole" begin
+    bytes(write!) = (io = IOBuffer(); write!(io); take!(io))
+    xs, ys = ["ab", "", "µs"], ["cde", "f", "g"]           # one string layout, two chunks
+    seeds = [
+        "strings beside numbers" => bytes() do io
+            tdms_segment(io, [("/", nothing, 0, ["name" => "fuzz"]), ("/'G'", nothing, 0, ["unit" => "V"]),
+                              ("/'G'/'i'", Int32, 2, []), ("/'G'/'s'", String, xs, ["unit_string" => "text"]),
+                              ("/'G'/'f'", Float64, 1, [])],
+                         vcat(i32(1, 2), tdms_strings(xs), f64(0.5), i32(3, 4), tdms_strings(ys), f64(1.5)))
+            tdms_segment(io, [("/'G'/'s'", String, ["one", "two"], [])],
+                         vcat(i32(5, 6), tdms_strings(["one", "two"]), f64(2.5)); newobj = false)
+            tdms_segment(io, [("/'G'/'s'", nothing, 0, [])], vcat(i32(7, 8), f64(3.5)); newobj = false)
+        end,
+        "strings, never closed" => bytes() do io
+            raw = vcat(i32(1, 2), tdms_strings(xs), i32(3, 4), tdms_strings(ys), i32(5, 6), tdms_strings(xs))
+            tdms_segment(io, [("/'G'/'i'", Int32, 2, []), ("/'G'/'s'", String, xs, [])], raw[1:end-3]; closed = false)
+        end,
+        "a lone string flagged interleaved" => bytes() do io
+            tdms_segment(io, [("/'G'/'s'", String, ys, [])], tdms_strings(ys); interleaved = true)
+        end,
+        "interleaved timestamps and numbers" => bytes() do io
+            ts = [TDMSReader.TimeStamp(3744278548 + k, UInt64(k) << 60) for k in 1:3]
+            objs = [("/'G'/'t'", TDMSReader.TimeStamp, 3, []), ("/'G'/'x'", Int16, 3, [])]
+            for s in 0:1
+                tdms_segment(io, objs, reduce(vcat, [vcat(tdms_bytes(t), tdms_bytes(Int16(10s + k))) for (k, t) in enumerate(ts)]);
+                             interleaved = true)
+            end
+        end,
+        "a channel paused, then resumed" => bytes() do io
+            tdms_segment(io, [("/'G'/'ch1'", Int32, 2, []), ("/'G'/'ch2'", Int32, 2, [])], i32(1, 2, 3, 4))
+            tdms_segment(io, [("/'G'/'ch1'", nothing, 0, [])], i32(5, 6); newobj = false)
+            tdms_segment(io, [("/'G'/'ch1'", Int32, :same, [])], i32(7, 8, 9, 10); newobj = false)
+        end,
+        [basename(p) => read(p) for p in (TDMSReader._example_incremental[6], TDMSReader._example_DAQmx,
+                                          joinpath(dirname(TDMSReader._example_tdms), "interleaved.tdms"),
+                                          joinpath(dirname(TDMSReader._example_tdms), "never_closed.tdms"))]...,
+    ]
+    r = XorShift(0x20261017)
+    bad = String[]
+    for (name, b) in seeds
+        dir = mktempdir(); path = joinpath(dir, "undamaged.tdms")
+        write(path, b)
+        undamaged = quietread(readtdms, path)               # each undamaged file reads, but DAQmx
+        @test undamaged isa TDMSReader.File || name == basename(TDMSReader._example_DAQmx)
+        damagedreads!(bad, name, b, r, 150, dir)
+    end
+    @test isempty(bad)
+    isempty(bad) || foreach(x -> @info(x), bad[1:min(10, end)])
+end

@@ -102,7 +102,7 @@ struct Group
     Group()= new(OrderedDict{String,Channel}(),OrderedDict{String,Any}())
 end
 Base.:haskey(h::Group, key)=haskey(h.channels, key)
-Base.:getkey(h::Group, key)=haskey(h.channels, key)
+Base.:getkey(h::Group, key, default)=getkey(h.channels, key, default)
 Base.:keys(a::Group)=keys(a.channels)
 ==(a::Group,b::Group) = (a.props == b.props) && (a.channels == b.channels)
 
@@ -113,7 +113,7 @@ struct File
     File() = new(OrderedDict{String,Group}(),OrderedDict{String,Any}())
 end
 Base.:haskey(h::File, key)=haskey(h.groups, key)
-Base.:getkey(h::File, key)=haskey(h.groups, key)
+Base.:getkey(h::File, key, default)=getkey(h.groups, key, default)
 Base.:keys(a::File)=keys(a.groups)
 ==(a::File,b::File) = (a.props == b.props) && (a.groups == b.groups)
 
