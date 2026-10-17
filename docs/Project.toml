@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+TDMSReader = "5454df60-b210-11e9-134e-3535854761ba"
+
+[compat]
+Documenter = "1"

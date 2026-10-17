@@ -1,4 +1,7 @@
 # TDMSReader
+[![CI](https://github.com/DanBerge/TDMSReader.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/DanBerge/TDMSReader.jl/actions/workflows/CI.yml)
+[![Coverage](https://codecov.io/gh/DanBerge/TDMSReader.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/DanBerge/TDMSReader.jl)
+
 Library to read National Instruments TDMS files in native Julia.
 
 ## Reading a whole file
@@ -63,3 +66,35 @@ Refused with an error rather than misread: big-endian files, DAQmx raw data, a
 string channel interleaved with other channels, string offsets that disagree
 with the size their raw data index declares, interleaved channels of different
 lengths, and versions other than 4712 and 4713.
+
+## How it is checked
+
+- **An independent reader.** 108 files: every file npTDMS's own test suite writes,
+  its four example files, and 18 more for cases in this code. npTDMS and this
+  package read each one, and must agree on every value and property. They agree on
+  68. The rest are files this package refuses (DAQmx, big-endian, a version it does
+  not know), files npTDMS refuses, and four where npTDMS widens a Float32 property
+  to Float64.
+- **Cut-off files.** Every prefix of the files both read (19,748 files: a crash at
+  each byte) reads as npTDMS reads it, except 8 where this package keeps a
+  segment's complete meta data that npTDMS drops.
+- **Damaged files.** 13,400 random corruptions of those files are read or refused
+  with an error: none ends in an internal error, allocates more than 512 MiB or
+  takes more than 5 s.
+- **Real captures.** 97 LabVIEW captures, 1 KB to 8.6 GB, read identically by
+  npTDMS and this package.
+- **CI** runs the tests on Julia 1.9, the LTS and the current release, on Linux,
+  Windows and macOS.
+
+The comparisons run outside the test suite; each problem they found has a test of
+its own.
+
+## AI disclosure
+
+Since September 2026 this package has been written with Claude Code (Claude Fable
+5.1, then Claude Opus 5.5) assisting: about two thirds of the source and most of
+the tests (by `git blame` on 17 October 2026, 612 of the 890 lines in `src/` and
+782 of the 896 in `test/`). Dan Berge wrote the original reader in 2019, with
+fixes from jaakkor2, rs7q5 and Nicolas Brantut. The real captures it is checked on
+are mine. I reviewed every change by hand, and the commits Claude contributed to
+carry a `Co-Authored-By: Claude` trailer. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md).
