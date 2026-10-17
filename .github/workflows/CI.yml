@@ -6,10 +6,10 @@ on:
       - master
   pull_request:
 
-# needed to allow julia-actions/cache to delete old caches that it has created
 permissions:
-  actions: write
+  actions: write     # julia-actions/cache prunes old caches
   contents: read
+  id-token: write    # Codecov upload via OIDC, no token secret
 
 jobs:
   test:
@@ -33,5 +33,5 @@ jobs:
         with:
           files: lcov.info
           disable_search: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           fail_ci_if_error: false
