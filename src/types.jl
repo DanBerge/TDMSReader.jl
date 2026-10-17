@@ -54,11 +54,17 @@ function fixlayout!(v::AbstractVector{TimeStamp})
     v
 end
 
+# 0x19 and 0x1A ("float with unit") are stored exactly as 9 and 10, 4- and 8-byte IEEE floats
 const tdsTypes=Dict{UInt32,DataType}(0=>tdsTypeVoid, 1=>Int8, 2=>Int16, 3=>Int32, 4=>Int64,
     5=>UInt8, 6=>UInt16, 7=>UInt32, 8=>UInt64, 9=>Float32, 10=>Float64, 11=>tdsTypeExtendedFloat,
-    0x19=>tdsTypeSingleFloatWithUnit, 0x1A => tdsTypeDoubleFloatWithUnit, 0x1B => tdsTypeExtendedFloatWithUnit,
+    0x19=>Float32, 0x1A => Float64, 0x1B => tdsTypeExtendedFloatWithUnit,
     0x20=>String, 0x21=>Bool, 0x08000C=>ComplexF32, 0x10000D=>ComplexF64, 0xFF_FF_FF_FF=>tdsTypeDAQmxRawData,
     0x44=>TimeStamp )
+
+"The Julia type for a TDMS data type code; a code not in the table is a damaged or unknown file."
+tdstype(code::UInt32) = get(tdsTypes, code) do
+    throw(ErrorException("unknown TDMS data type code 0x$(string(code, base = 16, pad = 8)); the file is damaged or newer than this reader"))
+end
 
 struct ToC
     kTocMetaData::Bool

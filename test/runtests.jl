@@ -250,24 +250,33 @@ let dir=joinpath(@__DIR__, "example_files")
 end
 
 # A minimal TDMS 2.0 writer, after NI's "TDMS File Format Internal Structure": the
-# 28-byte lead-in, meta data (object paths, raw data indexes, string properties),
-# then the raw data. Objects are (path, T, nvalues, props); T === nothing: no raw data.
+# 28-byte lead-in, meta data (object paths, raw data indexes, properties), then the raw
+# data. Objects are (path, T, nvalues, props); T === nothing: no raw data; nvalues ===
+# :same: the layout of the last segment. T may be a TDMS type code. A property value is
+# a string, or (type code, bytes). `newobj = false` carries the last segment's object
+# list over; `closed = false` writes the all-ones offset of a file that was never closed.
 tdms_str(s) = vcat(collect(reinterpret(UInt8, [UInt32(ncodeunits(s))])), codeunits(s))
-tdms_code(T) = T === Int16 ? UInt32(0x02) : T === TDMSReader.TimeStamp ? UInt32(0x44) : error("no TDMS code for $T here")
-function tdms_segment(io, objs, raw::AbstractVector{UInt8}; interleaved = false)
+tdms_code(T::Unsigned) = UInt32(T)
+tdms_code(T) = T === Int16 ? UInt32(0x02) : T === Int32 ? UInt32(0x03) : T === Float64 ? UInt32(0x0A) :
+               T === TDMSReader.TimeStamp ? UInt32(0x44) : error("no TDMS code for $T here")
+function tdms_segment(io, objs, raw::AbstractVector{UInt8}; interleaved = false, newobj = true, version = 4713, closed = true)
     meta = IOBuffer()
     write(meta, UInt32(length(objs)))
     for (path, T, n, props) in objs
         write(meta, tdms_str(path))
-        T === nothing ? write(meta, 0xFFFFFFFF) : write(meta, UInt32(20), tdms_code(T), UInt32(1), UInt64(n))
+        if T === nothing; write(meta, 0xFFFFFFFF)
+        elseif n === :same; write(meta, UInt32(0))
+        else write(meta, UInt32(20), tdms_code(T), UInt32(1), UInt64(n)) end
         write(meta, UInt32(length(props)))
         for (k, v) in props
-            write(meta, tdms_str(k), UInt32(0x20), tdms_str(v))
+            v isa AbstractString ? write(meta, tdms_str(k), UInt32(0x20), tdms_str(v)) :
+                                   write(meta, tdms_str(k), tdms_code(v[1]), v[2])
         end
     end
     m = take!(meta)
-    toc = UInt32(1 << 1 | 1 << 2) | (isempty(raw) ? UInt32(0) : UInt32(1 << 3)) | (interleaved ? UInt32(1 << 5) : UInt32(0))
-    write(io, b"TDSm", toc, UInt32(4713), UInt64(length(m) + length(raw)), UInt64(length(m)), m, raw)
+    toc = UInt32(1 << 1) | (newobj ? UInt32(1 << 2) : UInt32(0)) | (isempty(raw) ? UInt32(0) : UInt32(1 << 3)) |
+          (interleaved ? UInt32(1 << 5) : UInt32(0))
+    write(io, b"TDSm", toc, UInt32(version), closed ? UInt64(length(m) + length(raw)) : typemax(UInt64), UInt64(length(m)), m, raw)
 end
 
 # Reading should cost about the data it returns: not a boxed value per sample
@@ -434,4 +443,146 @@ end
         @test ok
         ok || @info "layout that failed" interleaved nseg nch chunks per
     end
+end
+
+# ---------------------------------------------------------------------------
+# Files that npTDMS (an independent reader) reads and these readers did not, or read
+# wrongly. Each was found by reading the files of npTDMS's own test suite, and others
+# written for the purpose, with both readers and comparing every value; the values
+# expected below are npTDMS's.
+# ---------------------------------------------------------------------------
+i32(xs...) = collect(reinterpret(UInt8, Int32[xs...]))
+
+@testset "names holding quotes, slashes and non-ASCII" begin
+    p = joinpath(mktempdir(), "names.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/'it''s'", nothing, 0, []), ("/'it''s'/'o''clock'", Int32, 2, []),
+                          ("/'a/b'/'y''/''z'", Int32, 1, []), ("/'µ'/'日本'", Int32, 1, [])], i32(1, 2, 3, 4))
+    end
+    f = readtdms(p)
+    @test Set(keys(f)) == Set(["it's", "a/b", "µ"])
+    @test f["it's", "o'clock"].data == Int32[1, 2]
+    @test f["a/b", "y'/'z"].data == Int32[3]
+    @test f["µ", "日本"].data == Int32[4]
+    @test tdmsread(p, "it's", "o'clock", 1:2) == Int32[1, 2]          # on demand, by the same names
+    @test tdmsinfo(p)["a/b", "y'/'z"].nsamples == 1
+    @test_throws ErrorException TDMSReader.objectnames("/'unclosed")
+    @test_throws ErrorException TDMSReader.objectnames("/'a'/'b'/'c'")
+end
+
+@testset "a channel listed with no raw data takes no part in that segment" begin
+    # segment 2 lists ch1 as having no data (the object list carried over); segment 3
+    # brings it back with its last layout, in its old place before ch2
+    p = joinpath(mktempdir(), "paused.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/'G'/'ch1'", Int32, 2, []), ("/'G'/'ch2'", Int32, 2, [])], i32(1, 2, 3, 4))
+        tdms_segment(io, [("/'G'/'ch1'", nothing, 0, [])], i32(5, 6); newobj = false)
+        tdms_segment(io, [("/'G'/'ch1'", Int32, :same, [])], i32(7, 8, 9, 10); newobj = false)
+    end
+    f = readtdms(p)
+    @test f["G", "ch1"].data == Int32[1, 2, 7, 8]
+    @test f["G", "ch2"].data == Int32[3, 4, 5, 6, 9, 10]
+    @test tdmsinfo(p)["G", "ch1"].nsamples == 4
+    @test tdmsread(p, "G", "ch2", 1:6) == f["G", "ch2"].data
+end
+
+@testset "a short final chunk: in proportion if the segment was closed, in layout order if not" begin
+    dir = mktempdir()
+    objs = [("/'G'/'a'", Int32, 2, []), ("/'G'/'b'", Int32, 2, [])]
+    p = joinpath(dir, "closed.tdms"); open(io -> tdms_segment(io, objs, i32(1:6...)), p, "w")
+    q = joinpath(dir, "never_closed.tdms"); open(io -> tdms_segment(io, objs, i32(1:6...); closed = false), q, "w")
+    f, g = readtdms(p), readtdms(q)
+    @test f["G", "a"].data == Int32[1, 2, 5] && f["G", "b"].data == Int32[3, 4, 6]
+    @test g["G", "a"].data == Int32[1, 2, 5, 6] && g["G", "b"].data == Int32[3, 4]
+    for (path, h) in ((p, f), (q, g)), c in ("a", "b")
+        n = length(h["G", c].data)
+        @test tdmsinfo(path)["G", c].nsamples == n && tdmsread(path, "G", c, 1:n) == h["G", c].data
+    end
+    # cut off inside a Float64: the fragment left is not read as the next channel's Int32
+    r = joinpath(dir, "fragment.tdms")
+    open(r, "w") do io
+        raw = vcat(reinterpret(UInt8, [1.5, 2.5]), i32(3, 4), reinterpret(UInt8, [5.5]), zeros(UInt8, 4))
+        tdms_segment(io, [("/'G'/'f'", Float64, 2, []), ("/'G'/'i'", Int32, 2, [])], raw; closed = false)
+    end
+    h = readtdms(r)
+    @test h["G", "f"].data == [1.5, 2.5, 5.5] && h["G", "i"].data == Int32[3, 4]
+    @test tdmsinfo(r)["G", "i"].nsamples == 2
+end
+
+@testset "interleaved channels of different lengths are refused" begin
+    p = joinpath(mktempdir(), "ragged.tdms")
+    open(io -> tdms_segment(io, [("/'G'/'a'", Int32, 3, []), ("/'G'/'b'", Int32, 2, [])], i32(1:5...); interleaved = true), p, "w")
+    @test_throws ErrorException readtdms(p)
+    @test_throws ErrorException tdmsinfo(p)
+end
+
+@testset "a file cut off inside a lead-in or the meta data keeps the segments before it" begin
+    dir = mktempdir()
+    whole = joinpath(dir, "whole.tdms")
+    open(whole, "w") do io
+        tdms_segment(io, [("/'G'/'c'", Int32, 2, ["unit_string" => "V"])], i32(1, 2))
+        tdms_segment(io, [("/'G'/'c'", Int32, 2, [])], i32(3, 4))
+    end
+    third = let io = IOBuffer(); tdms_segment(io, [("/'G'/'c'", Int32, 2, ["more" => "props"])], i32(5, 6)); take!(io) end
+    same = let io = IOBuffer(); tdms_segment(io, [("/'G'/'c'", Int32, :same, ["more" => "props"])], i32(5, 6); newobj = false); take!(io) end
+    # 40: the lead-in and 12 bytes of meta data; 60: inside the property of an object that keeps its layout
+    for (seg, k, msg) in ((third, 13, r"lead-in"), (third, 40, r"meta data"), (same, 60, r"meta data"))
+        p = joinpath(dir, "cut$k.tdms"); write(p, vcat(read(whole), seg[1:k]))
+        f = @test_logs (:warn, msg) readtdms(p)                   # warned once, not once per walk
+        @test f["G", "c"].data == Int32[1:4;] && !haskey(f["G", "c"].props, "more")
+        @test (@test_logs (:warn, msg) tdmsinfo(p))["G", "c"].nsamples == 4
+    end
+end
+
+@testset "TDMS 1.0 files (version 4712) read; versions not known are refused" begin
+    dir = mktempdir()
+    p = joinpath(dir, "v4712.tdms"); open(io -> tdms_segment(io, [("/'G'/'c'", Int32, 2, [])], i32(1, 2); version = 4712), p, "w")
+    @test readtdms(p)["G", "c"].data == Int32[1, 2]
+    q = joinpath(dir, "v4714.tdms"); open(io -> tdms_segment(io, [("/'G'/'c'", Int32, 2, [])], i32(1, 2); version = 4714), q, "w")
+    @test occursin("4714", sprint(showerror, try readtdms(q) catch e; e end))
+end
+
+@testset "single and double floats \"with unit\" read as Float32 and Float64" begin
+    p = joinpath(mktempdir(), "with_unit.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/'G'/'s'", 0x19, 2, ["gain" => (0x1A, collect(reinterpret(UInt8, [0.5])))]), ("/'G'/'d'", 0x1A, 1, [])],
+                     vcat(reinterpret(UInt8, Float32[1.25, -2.5]), reinterpret(UInt8, [3.75])))
+    end
+    f = readtdms(p)
+    @test f["G", "s"].data == Float32[1.25, -2.5] && f["G", "d"].data == [3.75]
+    @test f["G", "s"].props["gain"] === 0.5
+end
+
+@testset "a refused file is closed again" begin
+    # on Windows a file left open cannot be deleted until the garbage collector closes it
+    p = joinpath(mktempdir(), "daqmx.tdms"); cp(TDMSReader._example_DAQmx, p)
+    @test_throws ErrorException readtdms(p)
+    @test_throws ErrorException tdmsinfo(p)
+    rm(p)
+    @test !isfile(p)
+end
+
+@testset "not a TDMS file, and a channel that changes type, are clear errors" begin
+    dir = mktempdir()
+    p = joinpath(dir, "zip.tdms"); write(p, vcat(b"PK\x03\x04", zeros(UInt8, 40)))
+    @test occursin("TDSm", sprint(showerror, try readtdms(p) catch e; e end))
+    q = joinpath(dir, "retyped.tdms")
+    open(q, "w") do io
+        tdms_segment(io, [("/'G'/'c'", Int32, 1, [])], i32(1))
+        tdms_segment(io, [("/'G'/'c'", Float64, 1, [])], collect(reinterpret(UInt8, [2.0])))
+    end
+    @test occursin("changes data type", sprint(showerror, try readtdms(q) catch e; e end))
+end
+
+@testset "a damaged file is refused, without allocating what its fields claim" begin
+    dir = mktempdir()
+    good = let io = IOBuffer(); tdms_segment(io, [("/'G'/'c'", Int32, 2, [])], i32(1, 2)); take!(io) end
+    # bytes 29-32 hold the object count, 33-36 the path's length, 37-44 the path "/'G'/'c'",
+    # 45-48 the raw data index's length, 49-52 the data type, 53-56 the dimension, 57-64 the count
+    damaged(range, v) = (b = copy(good); b[range] = reinterpret(UInt8, [v]); p = tempname(dir); write(p, b); p)
+    p = damaged(33:36, 0xFFFFFFF0)
+    @test_throws EOFError readtdms(p)
+    @test (@allocated try readtdms(p) catch end) < 2^26           # not the 4 GiB the length claims
+    @test occursin("unknown TDMS data type", sprint(showerror, try readtdms(damaged(49:52, 0x003e0020)) catch e; e end))
+    @test occursin("values per chunk", sprint(showerror, try readtdms(damaged(57:64, typemax(UInt64))) catch e; e end))
 end
