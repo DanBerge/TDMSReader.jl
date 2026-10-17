@@ -33,37 +33,117 @@ function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
     need = databytes(info)
     need > memory && error("readtdms: $(repr(basename(fn))) holds $need bytes of channel data, more than " *
                            "memory=$memory; read it on demand with tdmsblocks or tdmsread instead")
-    sizes = Dict("/'$g'/'$c'" => ci.nsamples for ((g, c), ci) in info.channels)
-    s = open(fn)
+    sizes = Dict(objectpath(g, c) => ci.nsamples for ((g, c), ci) in info.channels)
     f=File()
     objdict=ObjDict()
-    fsize = filesize(fn)
+    open(fn) do s
+        # tdmsinfo has already warned about anything odd in the file
+        walksegments(s, filesize(fn), f, objdict; warn = false) do datapos, nbytes, interleaved, incomplete
+            for (path, c) in objdict.current
+                isempty(c.data) && sizehint!(c.data, get(sizes, path, 0))
+            end
+            moveto!(s, datapos)
+            readrawdata!(objdict, nbytes, interleaved, incomplete, s)
+        end
+    end
+    f
+end
+
+"""
+Walk the segments of an open file: read each lead-in and its meta data into `f` and
+`objdict`, and call `ondata(datapos, nbytes, interleaved, incomplete)` for each segment
+that holds raw data. A segment is `incomplete` when the file was never closed (LabVIEW
+crashed, power failed: the next-segment offset is all ones) or its offset runs past the
+end of the file; its data then runs to the end of the file, and the walk stops after it.
+A file that ends inside a lead-in, or inside the meta data of its last segment, keeps
+every segment before it.
+"""
+function walksegments(ondata::Function, s::IO, fsize::Integer, f::File, objdict::ObjDict; warn::Bool = true)
     while !eof(s)
         startpos = position(s)
+        if fsize - startpos < 28
+            warn && @warn "TDMS file ends inside the lead-in of a segment at byte $startpos; the segments before it are read"
+            break
+        end
         (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
+        room = UInt64(fsize - startpos - 28)              # bytes after this lead-in
+        incomplete = nextsegmentoffset > room             # includes the never-closed all-ones offset
+        segend = incomplete ? Int64(fsize) : startpos + 28 + Int64(nextsegmentoffset)
+        incomplete || rawdataoffset <= nextsegmentoffset ||
+            throw(ErrorException("TDMS segment at byte $startpos: raw data offset $rawdataoffset " *
+                                 "lies beyond the segment ($nextsegmentoffset bytes)"))
+        # raw data that would start past the end of the file is not there to read
+        datapos = rawdataoffset > room ? Int64(fsize) : startpos + 28 + Int64(rawdataoffset)
         if toc.kTocNewObjList
             empty!(objdict.current)
         end
         if toc.kTocMetaData
-            readmetadata!(f, objdict, s)
-            for (path, c) in objdict.current
-                isempty(c.data) && sizehint!(c.data, get(sizes, path, 0))
+            # meta data that may run past the end of the file is read only if it is all there
+            if rawdataoffset > room && !metadatacomplete(s, objdict)
+                warn && @warn "TDMS file ends inside the meta data of its last segment (byte $startpos); the segments before it are read"
+                break
             end
+            readmetadata!(f, objdict, s)
         end
-        # A file that was never closed (LabVIEW crashed, power failed) carries an
-        # all-ones next-segment offset: its data runs to end of file, and the last
-        # chunk may be partial. Clamp to what the file actually holds.
-        datapos = startpos + 28 + Int64(rawdataoffset)
-        segend = nextsegmentoffset == typemax(UInt64) ? fsize : min(fsize, startpos + 28 + Int64(nextsegmentoffset))
-        if toc.kTocRawData
-            moveto!(s, datapos)
-            readrawdata!(objdict, segend - datapos, toc.kTocInterleavedData, s)
+        if toc.kTocRawData && segend > datapos
+            ondata(datapos, segend - datapos, toc.kTocInterleavedData, incomplete)
         end
-        nextsegmentoffset == typemax(UInt64) && break
+        incomplete && break
         moveto!(s, segend)
     end
-    close(s)
-    f
+end
+
+"""
+Whether the meta data at the stream's position reads to its end before the file does. It
+is read into throwaway copies, so a segment cut off inside its meta data leaves nothing
+half-read behind; the stream is put back where it was.
+"""
+function metadatacomplete(s::IO, objdict::ObjDict)
+    p = position(s)
+    trial = ObjDict()
+    merge!(trial.current, objdict.current); merge!(trial.full, objdict.full)
+    try
+        readmetadata!(File(), trial, s)
+        true
+    catch e
+        e isa EOFError || rethrow()
+        false
+    finally
+        seek(s, p)
+    end
+end
+
+"The path a TDMS file gives the channel `c` of group `g`; a quote in a name is written twice."
+objectpath(g::AbstractString, c::AbstractString) =
+    "/'" * replace(g, "'" => "''") * "'/'" * replace(c, "'" => "''") * "'"
+
+"""
+The names in a TDMS object path: none for the root `/`, the group's for `/'group'`, the
+group's and the channel's for `/'group'/'channel'`. A quote inside a name is written
+twice (`/'it''s'`), and a name may hold a slash.
+"""
+function objectnames(p::String)
+    p == "/" && return String[]
+    malformed() = throw(ErrorException("TDMS object path $(repr(p)) is malformed"))
+    cu = codeunits(p); n = length(cu)
+    names = String[]; i = 1
+    while i <= n
+        (i < n && cu[i] == UInt8('/') && cu[i+1] == UInt8('\'')) || malformed()
+        i += 2
+        buf = IOBuffer()
+        while true
+            i <= n || malformed()
+            if cu[i] == UInt8('\'')
+                i < n && cu[i+1] == UInt8('\'') || (i += 1; break)
+                write(buf, UInt8('\'')); i += 2
+            else
+                write(buf, cu[i]); i += 1
+            end
+        end
+        push!(names, String(take!(buf)))
+    end
+    1 <= length(names) <= 2 || malformed()
+    names
 end
 
 """
@@ -76,32 +156,17 @@ values sits on disk. `tdmsread` and `tdmsblocks` use it to read samples on deman
 so a file never has to be held in memory whole.
 """
 function tdmsinfo(fn::AbstractString)
-    s = open(fn)
     f=File()
     objdict=ObjDict()
     runs = OrderedDict{String,Vector{Run}}()
-    fsize = filesize(fn)
-    while !eof(s)
-        startpos = position(s)
-        (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
-        if toc.kTocNewObjList
-            empty!(objdict.current)
+    open(fn) do s
+        walksegments(s, filesize(fn), f, objdict) do datapos, nbytes, interleaved, incomplete
+            locateruns!(runs, objdict, datapos, nbytes, interleaved, incomplete)
         end
-        if toc.kTocMetaData
-            readmetadata!(f, objdict, s)
-        end
-        datapos = startpos + 28 + Int64(rawdataoffset)
-        segend = nextsegmentoffset == typemax(UInt64) ? fsize : min(fsize, startpos + 28 + Int64(nextsegmentoffset))
-        if toc.kTocRawData && segend > datapos
-            locateruns!(runs, objdict, datapos, segend - datapos, toc.kTocInterleavedData)
-        end
-        nextsegmentoffset == typemax(UInt64) && break
-        moveto!(s, segend)
     end
-    close(s)
     channels = OrderedDict{Tuple{String,String},ChannelInfo}()
     for (g, grp) in f.groups, (c, ch) in grp.channels
-        rs = get(runs, "/'$g'/'$c'", Run[])
+        rs = get(runs, objectpath(g, c), Run[])
         starts = cumsum([1; [r.nvalues for r in rs]])
         channels[(g, c)] = ChannelInfo(eltype(ch.data), starts[end] - 1, ch.props, rs, starts[1:end-1])
     end
@@ -116,11 +181,13 @@ whole rows the segment holds. A partial final chunk yields whole values only. A
 run that continues the channel's previous one on disk (one channel written in
 many chunks) extends it, so it is read in one piece.
 """
-function locateruns!(runs, objdict::ObjDict, datapos::Integer, nbytes::Integer, interleaved::Bool)
-    # each channel's run list, element size and chunk length, looked up once per segment
-    chans = [(get!(() -> Run[], runs, path), sizeof(eltype(c.data)), Int(c.nsamples)) for (path, c) in objdict.current]
+function locateruns!(runs, objdict::ObjDict, datapos::Integer, nbytes::Integer, interleaved::Bool, incomplete::Bool)
+    # each channel's run list, element size and chunk length, looked up once per segment;
+    # a channel the segment lists as having no raw data takes no part in it
+    chans = [(get!(() -> Run[], runs, path), sizeof(eltype(c.data)), Int(c.nsamples)) for (path, c) in objdict.current if c.nsamples > 0]
     isempty(chans) && return
     if interleaved
+        checkinterleaved([n for (_, _, n) in chans])
         rowbytes = sum(esz for (_, esz, _) in chans)
         rows = nbytes ÷ rowbytes
         off = 0
@@ -129,19 +196,47 @@ function locateruns!(runs, objdict::ObjDict, datapos::Integer, nbytes::Integer, 
             off += esz
         end
     else
-        left = Int(nbytes); at = Int(datapos)
-        while left > 0
-            before = left
-            for (v, esz, nsamples) in chans
-                n = min(nsamples, left ÷ esz)
-                n > 0 && addrun!(v, Run(at, n, esz))
-                at += n * esz; left -= n * esz
-                left > 0 || break
-            end
-            left < before || break        # only a fragment of a value remains
+        nchunks, last = chunkplan([esz for (_, esz, _) in chans], [n for (_, _, n) in chans], nbytes, incomplete)
+        at = Int(datapos)
+        for k in 1:nchunks + 1, (i, (v, esz, nsamples)) in enumerate(chans)
+            n = k <= nchunks ? nsamples : last[i]
+            n > 0 && addrun!(v, Run(at, n, esz))
+            at += n * esz
         end
     end
 end
+
+"""
+How the raw data of a contiguous segment divides between its channels: `nchunks` whole
+chunks, each holding every channel's `counts[i]` values in turn, then a short final chunk
+of `last[i]` values per channel. NI's format description does not say what a short final
+chunk holds. In a segment the writer closed, it is read as every channel with fewer values,
+in proportion (the reading npTDMS gives such files). In an `incomplete` segment, one the
+writer never finished, the values stop where the file does: channels in layout order, and
+nothing after the first channel that is cut short.
+"""
+function chunkplan(sizes::Vector{Int}, counts::Vector{Int}, nbytes::Integer, incomplete::Bool)
+    chunk = sum(Int128.(sizes) .* counts)
+    nchunks, rem = Int.(divrem(Int128(nbytes), chunk))
+    last = zeros(Int, length(counts))
+    if !incomplete
+        for i in eachindex(counts)
+            last[i] = Int(div(widemul(counts[i], rem), chunk))
+        end
+    else
+        left = rem
+        for i in eachindex(counts)
+            last[i] = min(counts[i], left ÷ sizes[i])
+            left -= last[i] * sizes[i]
+            last[i] < counts[i] && break
+        end
+    end
+    nchunks, last
+end
+
+"Interleaved rows hold one value of every channel, so every channel must have the same length."
+checkinterleaved(counts) = allequal(counts) ||
+    throw(ErrorException("TDMS interleaved segment lists channels of different lengths $(counts); its rows cannot be split"))
 
 "Append `r` to `v`, or extend the last run if `r` carries on from it on disk."
 function addrun!(v::Vector{Run}, r::Run)
@@ -244,10 +339,14 @@ function readrange!(out::AbstractVector{T}, at::Integer, s::IO, ci::ChannelInfo,
 end
 
 function readleadin(s::IO)
-    @assert ntoh(read(s, UInt32)) == 0x54_44_53_6D
+    at = position(s)
+    tag = read(s, 4)
+    tag == b"TDSm" || throw(ErrorException("Not a TDMS segment at byte $at: it starts $(repr(String(copy(tag)))), not \"TDSm\""))
     toc=ToC(ltoh(read(s, UInt32)))
     toc.kTocBigEndian && throw(ErrorException("Big Endian files not supported"))
-    read(s, UInt32) == 4713 || throw(ErrorException("File not recongnized as TDMS formatted file"))
+    # 4712 is TDMS 1.0 (what npTDMS writes), 4713 TDMS 2.0; the layout read here is common to both
+    version = read(s, UInt32)
+    version in (4712, 4713) || throw(ErrorException("TDMS segment at byte $at has version $version; only 4712 and 4713 are known"))
 
     return (toc=toc,nextsegmentoffset=read(s, UInt64),rawdataoffset=read(s, UInt64),)
 end
@@ -260,25 +359,34 @@ function readmetadata!(f::File, objdict::ObjDict, s::IO)
 end
 
 function readobj!(f::File, objdict::ObjDict, s::IO)
-    objpath = String(read(s, read(s, UInt32)))
+    objpath = readstring(s)
     # @info "Read @ position $(hexstring(position(s)))"
     rawdata=read(s, UInt32)
     hasrawdata=false
     hasnewchunk=false
     if rawdata==0xFF_FF_FF_FF #No Raw Data
+        # in this segment: a channel carried over from the last one keeps its place in
+        # the object list, but holds no values here
+        if haskey(objdict.current, objpath)
+            c = objdict.current[objpath]
+            objdict.current[objpath] = Chunk{eltype(c.data)}(c.data, zero(UInt64))
+        end
     elseif rawdata==zero(UInt32) #Keep Chunk layout
         haskey(objdict.full, objpath) || throw(ErrorException("Previous Segment Missing"))
         hasrawdata=true
+        T=eltype(objdict.full[objpath].data)
     elseif rawdata==0x00_00_12_69 || rawdata==0x00_00_13_69
         readDAQmx(s::IO, rawdata)
         throw(ErrorException("Not Implemented"))
     else
         hasrawdata=true
         hasnewchunk=true
-        T=tdsTypes[read(s, UInt32)]
+        T=tdstype(read(s, UInt32))
         ( T <: TDMSUnimplementedType ) && throw(ErrorException("TDMS Data Type of $T is not supported"))
         read(s,UInt32)==1 || throw(ErrorException("TDMS Array Dimension is not 1"))
         n=read(s,UInt64)
+        # 2^56 values of 16 bytes or less: more than any file holds, and safe to multiply
+        n <= 1 << 56 || throw(ErrorException("TDMS channel $objpath declares $n values per chunk; the file is damaged"))
         if T == String
             throw(ErrorException("Need Functionality to Read String as raw data"))
         end
@@ -289,9 +397,9 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
         props=f.props
         readprop!(props,s)
     else
-        m=match(r"\/'(.+?)'(?:\/'(.+)')?", objpath)
-        isnothing(m.captures) && throw(ErrorException("Object Path $objpath is malformed"))
-        group,channel=m.captures[1:2]
+        names = objectnames(objpath)
+        group = names[1]
+        channel = length(names) == 2 ? names[2] : nothing
         g=if haskey(f.groups, group)
             f[group]
         else
@@ -304,6 +412,8 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
             if haskey(g.channels,channel)
                 if hasnewchunk && eltype(g[channel].data)==Nothing #need to replace existing channel if created without having data
                     setindex!(g.channels,TDMSReader.Channel{T}(g[channel].props),channel) #convert existing channel
+                elseif hasnewchunk && eltype(g[channel].data) != T
+                    throw(ErrorException("TDMS channel $objpath changes data type from $(eltype(g[channel].data)) to $T"))
                 end
                 chan = g[channel]
             else
@@ -327,13 +437,26 @@ end
 
 # Strings are read with `read(s, n)`, which allocates n bytes: `readbytes!` into an
 # empty vector first grows it to 64 KiB, which cost that much per string in the meta data.
+"""
+A length-prefixed string; a file that ends inside it is an `EOFError`, not a short
+string. A length longer than the rest of the file (a damaged length field) is refused
+before anything is allocated; only long strings pay for the check.
+"""
+function readstring(s::IO)
+    n = read(s, UInt32)
+    n > 1 << 16 && s isa IOStream && n > filesize(s) - position(s) && throw(EOFError())
+    b = read(s, n)
+    length(b) == n || throw(EOFError())
+    String(b)
+end
+
 function readprop!(props, s::IO)
     n=read(s,UInt32)
     for i=1:n
-        propname = String(read(s, read(s, UInt32)))
-        T = tdsTypes[read(s,UInt32)]
+        propname = readstring(s)
+        T = tdstype(read(s,UInt32))
         if T==String
-            props[propname] = String(read(s, read(s, UInt32)))
+            props[propname] = readstring(s)
         else
             propval=read(s,T)
             props[propname]=propval
@@ -362,12 +485,14 @@ after another. Interleaved layout (`kTocInterleavedData`): each chunk holds
 `nsamples` rows of one value per channel. A final chunk that the file cuts short
 yields as many whole values as it holds, in layout order, and no more.
 """
-function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, s::IO)
-    chans = collect(values(objdict.current))
+function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, incomplete::Bool, s::IO)
+    # a channel the segment lists as having no raw data takes no part in it
+    chans = [c for c in values(objdict.current) if c.nsamples > 0]
     isempty(chans) && return nothing
     left = Int(nbytes)
     if interleaved
         # Whole rows only, read in blocks of at most 16 MiB and split per channel.
+        checkinterleaved([Int(c.nsamples) for c in chans])
         rowbytes = sum(sizeof(eltype(c.data)) for c in chans)
         rows = left ÷ rowbytes
         buf = Vector{UInt8}(undef, min(rows, max(1, (1 << 24) ÷ rowbytes)) * rowbytes)
@@ -383,13 +508,13 @@ function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, s::I
             done += k
         end
     else
-        while left > 0
-            before = left
-            for c in chans
-                left -= readchunk!(c.data, min(Int(c.nsamples), left ÷ sizeof(eltype(c.data))), s)
-                left > 0 || break
-            end
-            left < before || break        # only a fragment of a value remains
+        counts = [Int(c.nsamples) for c in chans]
+        nchunks, last = chunkplan([sizeof(eltype(c.data)) for c in chans], counts, left, incomplete)
+        for _ in 1:nchunks, (c, n) in zip(chans, counts)
+            readchunk!(c.data, n, s)
+        end
+        for (c, n) in zip(chans, last)
+            readchunk!(c.data, n, s)
         end
     end
     return nothing
@@ -423,26 +548,26 @@ function seekalign(s::IO)
 end
 
 function readDAQmx(s::IO, id)
-    @info "Read DAQmc Raw Data @ $(hexstring(id))"
-    T = tdsTypes[read(s, UInt32)]
-    @info "Data type $T"
+    @debug "Read DAQmc Raw Data @ $(hexstring(id))"
+    T = tdstype(read(s, UInt32))
+    @debug "Data type $T"
     read(s, UInt32)==1 || throw(ErrorException("TDMS Array Dimension is not 1"))
     chunksize = read(s, UInt64)
-    @info "Chunk size = $chunksize"
+    @debug "Chunk size = $chunksize"
 
-    @info "Read vector of format change scalers"
+    @debug "Read vector of format change scalers"
     vectorsize = read(s, UInt32)
-    V = tdsTypes[read(s, UInt32)]
+    V = tdstype(read(s, UInt32))
     rawbufferindex = read(s, UInt32)
     rawbyteoffset = read(s, UInt32)
     sampleformatbitmap = read(s, UInt32)
     scaleid = read(s,UInt32)
-    @info "Vector Size = $vectorsize"
-    @info "DAQmx data type = $V"
-    @info "Raw Buffer Index = $rawbufferindex"
-    @info "Raw byte offset = $rawbyteoffset"
-    @info "Sample Format Bitmatp = $sampleformatbitmap"
-    @info "Scale ID = $scaleid"
+    @debug "Vector Size = $vectorsize"
+    @debug "DAQmx data type = $V"
+    @debug "Raw Buffer Index = $rawbufferindex"
+    @debug "Raw byte offset = $rawbyteoffset"
+    @debug "Sample Format Bitmatp = $sampleformatbitmap"
+    @debug "Scale ID = $scaleid"
     # Parsing stops here: the caller raises "Not Implemented". (An empty loop over an
     # undefined `n` used to raise UndefVarError first, hiding that message.)
 end

@@ -37,12 +37,21 @@ takes `memory`, a byte budget for its buffer, as well as `blocksize`.
 
 ## What it reads
 
-- TDMS 2.0 files (version 4713), little-endian
-- numeric and TimeStamp channels
+- TDMS 1.0 and 2.0 files (versions 4712 and 4713), little-endian
+- numeric (including "with unit" floats), complex, Boolean and TimeStamp channels
 - contiguous and interleaved raw data, several chunks per segment, and meta data
-  that changes from segment to segment
+  that changes from segment to segment, including channels that hold no data in
+  some segments
+- group and channel names holding quotes, slashes or any Unicode
 - files that were never closed (the application stopped mid-write), whose last
-  chunk may be partial
+  chunk may be partial; a file that ends inside a segment's lead-in or meta data
+  gives every segment before it, with a warning
+
+A short final chunk in a segment the writer closed is read as every channel with
+fewer values, in proportion; in a segment cut short, the values stop where the
+file does. NI's format description does not cover the first case; npTDMS reads
+it the same way.
 
 Refused with an error rather than misread: big-endian files, DAQmx raw data,
-string channels, and TDMS 1.0 files (version 4712).
+string channels, interleaved channels of different lengths, and versions other
+than 4712 and 4713.
