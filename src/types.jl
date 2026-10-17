@@ -117,9 +117,15 @@ Base.:getkey(h::File, key)=haskey(h.groups, key)
 Base.:keys(a::File)=keys(a.groups)
 ==(a::File,b::File) = (a.props == b.props) && (a.groups == b.groups)
 
+"""
+How one channel's values sit in each chunk of the current segment: `nsamples` values in
+`nbytes` bytes -- `nsamples` times the element size, or for a string channel the total
+its raw data index declares (the strings' end offsets and their text).
+"""
 struct Chunk{T}
     data::Vector{T}
     nsamples::UInt64
+    nbytes::UInt64
 end
 
 struct ObjDict
@@ -160,7 +166,9 @@ end
 """
 One run of a channel's raw values on disk: `nvalues` values starting at byte
 `offset`, `stride` bytes apart (the element size when the chunk is contiguous,
-the row size when it is interleaved).
+the row size when it is interleaved). A string has no fixed size, so a run of a
+string channel is one chunk: `nvalues` UInt32 end offsets from byte `offset`, then
+the text, `stride` bytes in all.
 """
 struct Run
     offset::Int64
