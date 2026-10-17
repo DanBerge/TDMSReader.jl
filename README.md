@@ -1,4 +1,7 @@
 # TDMSReader
+[![CI](https://github.com/DanBerge/TDMSReader.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/DanBerge/TDMSReader.jl/actions/workflows/CI.yml)
+[![Coverage](https://codecov.io/gh/DanBerge/TDMSReader.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/DanBerge/TDMSReader.jl)
+
 Library to read National Instruments TDMS files in native Julia.
 
 ## Reading a whole file
@@ -63,3 +66,18 @@ Refused with an error rather than misread: big-endian files, DAQmx raw data, a
 string channel interleaved with other channels, string offsets that disagree
 with the size their raw data index declares, interleaved channels of different
 lengths, and versions other than 4712 and 4713.
+
+## AI assistance
+
+About two thirds of the source and most of the tests were written with Claude
+Code, Anthropic's AI coding assistant (Claude Fable 5.1 and Claude Opus 5.5).
+Every commit since September 2026 was made that way and carries a
+`Co-Authored-By: Claude` line. On 17 October 2026, `git blame` attributes 610 of
+the 910 lines in `src/` and 592 of the 706 lines in `test/` to those commits.
+Dan Berge wrote the original reader in 2019, with fixes from jaakkor2, rs7q5 and
+Nicolas Brantut.
+
+Those changes were checked against npTDMS, an independent reader, on its own
+test files, on truncated and corrupted copies of them, and on real LabVIEW
+captures ([#12](https://github.com/DanBerge/TDMSReader.jl/pull/12),
+[#13](https://github.com/DanBerge/TDMSReader.jl/pull/13)).
