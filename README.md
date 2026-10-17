@@ -96,5 +96,5 @@ Since September 2026 this package has been written with Claude Code (Claude Fabl
 the tests (by `git blame` on 17 October 2026, 612 of the 890 lines in `src/` and
 782 of the 896 in `test/`). Dan Berge wrote the original reader in 2019, with
 fixes from jaakkor2, rs7q5 and Nicolas Brantut. The real captures it is checked on
-are mine. The commits Claude contributed to carry a `Co-Authored-By: Claude`
-trailer. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md).
+are mine. I reviewed every change by hand, and the commits Claude contributed to
+carry a `Co-Authored-By: Claude` trailer. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md).

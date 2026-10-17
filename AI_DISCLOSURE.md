@@ -10,6 +10,7 @@ scope: |
   Claude Code assisting. The original reader (Dan Berge, 2019) and the fixes
   by jaakkor2, rs7q5 and Nicolas Brantut predate it. The real captures the
   reader was checked on are human measurements.
+  Every change was reviewed by hand.
   Commits Claude contributed to carry a Co-Authored-By: Claude trailer.
 last-updated: 2026-10-17
 ---
