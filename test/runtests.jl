@@ -706,6 +706,65 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# What no test above ran (found by a coverage run): TimeStamp properties, conversion and
+# arithmetic; a channel that is listed before it is given any data; indexing info by
+# name and number together; haskey and getkey on files and groups.
+# ---------------------------------------------------------------------------
+@testset "TimeStamp properties, conversion and arithmetic" begin
+    TS, TD = TDMSReader.TimeStamp, TDMSReader.TimeDate
+    ts = TS(3744278548, 0x8000000000000000)
+    p = joinpath(mktempdir(), "timestamp_props.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/", nothing, 0, ["created" => (0x44, tdms_bytes(ts))]),
+                          ("/'G'/'c'", Int32, 2, ["wf_start_time" => (0x44, tdms_bytes(TS(1, 0))), "unit_string" => "V"])],
+                     i32(1, 2))
+    end
+    f = readtdms(p)
+    @test f.props["created"] === ts
+    @test f["G", "c"].props["wf_start_time"] === TS(1, 0) && f["G", "c"].props["unit_string"] == "V"
+    @test f["G", "c"].data == Int32[1, 2]
+    @test tdmsinfo(p)["G", "c"].props["wf_start_time"] === TS(1, 0)
+    # whole seconds since 1904-01-01, and fractions of 2^-64 s
+    @test TD(TS(0, 0)) == TD(1904, 1, 1)
+    @test TD(TS(86400, 0)) == TD(1904, 1, 2)
+    @test TD(TS(-1, 0)) == TD(1903, 12, 31, 23, 59, 59)
+    @test TD(TS(0, 0x8000000000000000)) == TD(1904, 1, 1) + TDMSReader.Nanosecond(500_000_000)
+    # sums and differences carry between the fractions and the seconds
+    a, b = TS(1, 0xC000000000000000), TS(2, 0x8000000000000000)          # 1.75 s and 2.5 s
+    @test a + b === TS(4, 0x4000000000000000)
+    @test b - a === TS(0, 0xC000000000000000)
+    @test (a + b) - b === a
+    @test sprint(show, ts) == sprint(show, TD(ts))
+end
+
+@testset "a channel listed before it has data takes the type of its first data" begin
+    p = joinpath(mktempdir(), "late.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/'G'/'c'", nothing, 0, ["unit_string" => "V"]), ("/'G'/'d'", Int32, 1, [])], i32(7))
+        tdms_segment(io, [("/'G'/'c'", Float64, 2, ["more" => "x"]), ("/'G'/'d'", Int32, 1, [])], vcat(f64(0.5, 1.5), i32(8)))
+    end
+    f = readtdms(p)
+    @test eltype(f["G", "c"].data) == Float64 && f["G", "c"].data == [0.5, 1.5]
+    @test f["G", "c"].props["unit_string"] == "V" && f["G", "c"].props["more"] == "x"
+    @test collect(keys(f["G"])) == ["c", "d"] && f["G", "d"].data == Int32[7, 8]
+    info = tdmsinfo(p)
+    @test info["G", "c"].eltype == Float64 && tdmsread(info, "G", "c", 1:2) == [0.5, 1.5]
+end
+
+@testset "info indexed by name and number together; haskey and getkey on files and groups" begin
+    p = joinpath(mktempdir(), "keys.tdms")
+    open(io -> tdms_segment(io, [("/'G'/'a'", Int32, 1, []), ("/'G'/'b'", Int32, 1, []), ("/'H'/'c'", Int32, 1, [])],
+                            i32(1, 2, 3)), p, "w")
+    f, info = readtdms(p), tdmsinfo(p)
+    @test info["G", 2] === info[1, "b"] === info[1, 2] === info["G", "b"]
+    @test info["H", 1] === info[2, "c"] === info["H", "c"]
+    @test haskey(f, "G") && !haskey(f, "nope") && haskey(f["G"], "b") && !haskey(f["G"], "c")
+    # getkey is Base's: the key if there is one, else the default
+    @test getkey(f, "H", nothing) == "H" && getkey(f, "nope", :none) === :none
+    @test getkey(f["G"], "a", nothing) == "a" && getkey(f["G"], "c", :none) === :none
+end
+
+# ---------------------------------------------------------------------------
 # Damaged files at random. Files of each kind tested above are damaged many times over:
 # bytes changed, extreme values written over 4- and 8-byte fields and over the first
 # lead-in, the file cut short. The damage is the same on every run. A damaged file must

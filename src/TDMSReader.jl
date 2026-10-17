@@ -521,20 +521,6 @@ function readprop!(props, s::IO)
     end
 end
 
-function readrawdata!(objects::NTuple{N,Chunk}, nbytes::Integer, s::IO) where N
-    n = 0
-    while n < nbytes && !eof(s)
-        for x in objects
-            T = eltype(x.data)
-            for i=1:x.nsamples
-                push!(x.data, read(s,T))
-                n += sizeof(T)
-            end
-        end
-    end
-    return nothing
-end
-
 """
 Read `nbytes` of raw data for the channels in `objdict.current`, chunk after chunk.
 Contiguous layout: each chunk holds every channel's `nsamples` values one channel
@@ -661,12 +647,6 @@ function readchunk!(v::Vector{T}, n::Integer, s::IO) where {T}
     read!(s, view(v, m+1:m+n))
     fixlayout!(view(v, m+1:m+n))
     n*sizeof(T)
-end
-
-function seekalign(s::IO)
-    x = position(s)
-    mask = typeof(x)(0b11)
-    seek(s, ifelse(x & mask > 0,x  & ~mask + 4, x))
 end
 
 function readDAQmx(s::IO, id)
