@@ -16,7 +16,9 @@ function readtdms(fn::AbstractString)
     s = open(fn)
     f=File()
     objdict=ObjDict()
+    fsize = filesize(fn)
     while !eof(s)
+        startpos = position(s)
         (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
         if toc.kTocNewObjList
             empty!(objdict.current)
@@ -24,9 +26,17 @@ function readtdms(fn::AbstractString)
         if toc.kTocMetaData
             readmetadata!(f, objdict, s)
         end
+        # A file that was never closed (LabVIEW crashed, power failed) carries an
+        # all-ones next-segment offset: its data runs to end of file, and the last
+        # chunk may be partial. Clamp to what the file actually holds.
+        datapos = startpos + 28 + Int64(rawdataoffset)
+        segend = nextsegmentoffset == typemax(UInt64) ? fsize : min(fsize, startpos + 28 + Int64(nextsegmentoffset))
         if toc.kTocRawData
-            readrawdata!(objdict, nextsegmentoffset-rawdataoffset, s)
+            seek(s, datapos)
+            readrawdata!(objdict, segend - datapos, toc.kTocInterleavedData, s)
         end
+        nextsegmentoffset == typemax(UInt64) && break
+        seek(s, segend)
     end
     close(s)
     f
@@ -84,9 +94,7 @@ function readmetadata!(f::File, objdict::ObjDict, s::IO)
 end
 
 function readobj!(f::File, objdict::ObjDict, s::IO)
-    b=UInt8[]
-    readbytes!(s, b, read(s, UInt32))
-    objpath = String(b); empty!(b)
+    objpath = String(read(s, read(s, UInt32)))
     # @info "Read @ position $(hexstring(position(s)))"
     rawdata=read(s, UInt32)
     hasrawdata=false
@@ -151,17 +159,15 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
     end
 end
 
+# Strings are read with `read(s, n)`, which allocates n bytes: `readbytes!` into an
+# empty vector first grows it to 64 KiB, which cost that much per string in the meta data.
 function readprop!(props, s::IO)
-    b=UInt8[]
     n=read(s,UInt32)
     for i=1:n
-        readbytes!(s, b, read(s, UInt32))
-        propname = String(b); empty!(b)
+        propname = String(read(s, read(s, UInt32)))
         T = tdsTypes[read(s,UInt32)]
         if T==String
-            readbytes!(s, b, read(s, UInt32))
-            props[propname] = String(b)
-            empty!(b)
+            props[propname] = String(read(s, read(s, UInt32)))
         else
             propval=read(s,T)
             props[propname]=propval
@@ -183,20 +189,64 @@ function readrawdata!(objects::NTuple{N,Chunk}, nbytes::Integer, s::IO) where N
     return nothing
 end
 
-function readrawdata!(objdict::ObjDict, nbytes::Integer, s::IO)
-    n = 0
-    while n < nbytes && !eof(s)
-        for (key,val) in objdict.current
-            n += readchunk!(val.data, val.nsamples, s)
+"""
+Read `nbytes` of raw data for the channels in `objdict.current`, chunk after chunk.
+Contiguous layout: each chunk holds every channel's `nsamples` values one channel
+after another. Interleaved layout (`kTocInterleavedData`): each chunk holds
+`nsamples` rows of one value per channel. A final chunk that the file cuts short
+yields as many whole values as it holds, in layout order, and no more.
+"""
+function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, s::IO)
+    chans = collect(values(objdict.current))
+    isempty(chans) && return nothing
+    left = Int(nbytes)
+    if interleaved
+        # Whole rows only, read in blocks of at most 16 MiB and split per channel.
+        rowbytes = sum(sizeof(eltype(c.data)) for c in chans)
+        rows = left ÷ rowbytes
+        buf = Vector{UInt8}(undef, min(rows, max(1, (1 << 24) ÷ rowbytes)) * rowbytes)
+        done = 0
+        while done < rows
+            k = min(rows - done, length(buf) ÷ rowbytes)
+            read!(s, view(buf, 1:k*rowbytes))
+            off = 0
+            for c in chans
+                deinterleave!(c.data, buf, off, rowbytes, k)
+                off += sizeof(eltype(c.data))
+            end
+            done += k
+        end
+    else
+        while left > 0
+            before = left
+            for c in chans
+                left -= readchunk!(c.data, min(Int(c.nsamples), left ÷ sizeof(eltype(c.data))), s)
+                left > 0 || break
+            end
+            left < before || break        # only a fragment of a value remains
         end
     end
     return nothing
 end
 
-function readchunk!(v::Vector{T}, n::Integer, s::IO) where {T}
-    for i = 1:n
-        push!(v, read(s,T))
+"Append `k` values of `T` to `v`, `stride` bytes apart in `buf` from byte offset `off`."
+function deinterleave!(v::Vector{T}, buf::Vector{UInt8}, off::Int, stride::Int, k::Int) where {T}
+    m = length(v)
+    resize!(v, m + k)
+    GC.@preserve buf for i in 0:k-1
+        @inbounds v[m + 1 + i] = unsafe_load(Ptr{T}(pointer(buf, off + i * stride + 1)))
     end
+    fixlayout!(view(v, m+1:m+k))
+    v
+end
+
+"Append `n` values of `T` to `v` in one read; returns the bytes consumed."
+function readchunk!(v::Vector{T}, n::Integer, s::IO) where {T}
+    n <= 0 && return 0
+    m = length(v)
+    resize!(v, m + n)
+    read!(s, view(v, m+1:m+n))
+    fixlayout!(view(v, m+1:m+n))
     n*sizeof(T)
 end
 
@@ -227,11 +277,8 @@ function readDAQmx(s::IO, id)
     @info "Raw byte offset = $rawbyteoffset"
     @info "Sample Format Bitmatp = $sampleformatbitmap"
     @info "Scale ID = $scaleid"
-
-    for i in 1:n
-
-    end
-
+    # Parsing stops here: the caller raises "Not Implemented". (An empty loop over an
+    # undefined `n` used to raise UndefVarError first, hiding that message.)
 end
 
 function hexstring(x::Integer)

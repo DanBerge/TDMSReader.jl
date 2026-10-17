@@ -40,6 +40,20 @@ function Base.:read(s::IO, ::Type{TimeStamp})
     TimeStamp(seconds,fractions)
 end
 
+"""
+Put values copied byte for byte from the file into the element type's field order.
+Only TimeStamp differs: the file holds (fractions, seconds), the struct (seconds,
+fractions). Every other element type is already in order.
+"""
+fixlayout!(v::AbstractVector) = v
+function fixlayout!(v::AbstractVector{TimeStamp})
+    for i in eachindex(v)
+        x = v[i]
+        v[i] = TimeStamp(reinterpret(Int64, x.fractions), reinterpret(UInt64, x.seconds))
+    end
+    v
+end
+
 const tdsTypes=Dict{UInt32,DataType}(0=>tdsTypeVoid, 1=>Int8, 2=>Int16, 3=>Int32, 4=>Int64,
     5=>UInt8, 6=>UInt16, 7=>UInt32, 8=>UInt64, 9=>Float32, 10=>Float64, 11=>tdsTypeExtendedFloat,
     0x19=>tdsTypeSingleFloatWithUnit, 0x1A => tdsTypeDoubleFloatWithUnit, 0x1B => tdsTypeExtendedFloatWithUnit,
