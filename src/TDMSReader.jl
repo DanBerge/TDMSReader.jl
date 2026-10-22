@@ -27,6 +27,7 @@ valuebytes(ci::ChannelInfo) =
 
 """
     readtdms(fn; memory = Sys.free_memory()) -> File
+    readtdms(io::IO; memory = Sys.free_memory()) -> File
 
 Read the whole file into memory. `memory` is the byte budget the channel data
 may occupy. A walk of the meta data alone (`tdmsinfo`) finds how much data the
@@ -34,24 +35,40 @@ file holds before any of it is read, so a file that would exceed the budget is
 refused up front, with a pointer to `tdmsblocks` / `tdmsread`, which read on
 demand. The same walk sizes every channel, so the data is allocated once rather
 than grown chunk by chunk.
+
+A stream must be seekable (an `IOStream` or `IOBuffer`, say); the file is read from
+its current position to its end.
 """
-function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
-    info = tdmsinfo(fn)
+readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory())) =
+    open(s -> readstream(s, filesize(fn), repr(basename(fn)), memory), fn)
+readtdms(io::IO; memory::Integer = Int(Sys.free_memory())) = readstream(io, streamend(io), "the stream", memory)
+
+"The position of the end of a seekable stream; the stream is left where it was."
+function streamend(io::IO)
+    p = position(io)
+    seekend(io)
+    e = position(io)
+    seek(io, p)
+    e
+end
+
+function readstream(s::IO, fsize::Integer, name::AbstractString, memory::Integer)
+    p0 = position(s)
+    info = infostream(s, fsize, "", nothing)
     need = databytes(info)
-    need > memory && error("readtdms: $(repr(basename(fn))) holds $need bytes of channel data, more than " *
+    need > memory && error("readtdms: $name holds $need bytes of channel data, more than " *
                            "memory=$memory; read it on demand with tdmsblocks or tdmsread instead")
     sizes = Dict(objectpath(g, c) => ci.nsamples for ((g, c), ci) in info.channels)
     f=File()
     objdict=ObjDict()
-    open(fn) do s
-        # tdmsinfo has already warned about anything odd in the file
-        walksegments(s, filesize(fn), f, objdict; warn = false) do datapos, nbytes, interleaved, incomplete
-            for (path, c) in objdict.current
-                isempty(c.data) && sizehint!(c.data, get(sizes, path, 0))
-            end
-            moveto!(s, datapos)
-            readrawdata!(objdict, nbytes, interleaved, incomplete, s)
+    seek(s, p0)
+    # the walk for info has already warned about anything odd in the file
+    walksegments(s, fsize, f, objdict; warn = false) do datapos, nbytes, interleaved, incomplete
+        for (path, c) in objdict.current
+            isempty(c.data) && sizehint!(c.data, get(sizes, path, 0))
         end
+        moveto!(s, datapos)
+        readrawdata!(objdict, nbytes, interleaved, incomplete, s)
     end
     f
 end
@@ -155,21 +172,26 @@ end
 
 """
     tdmsinfo(fn) -> TDMSInfo
+    tdmsinfo(io::IO) -> TDMSInfo
 
 Walk the file's metadata WITHOUT reading any raw data: every property, group and
 channel as `readtdms` would give them (with empty data vectors), plus per channel
 the element type, the sample count the file actually holds, and where each run of
 values sits on disk. `tdmsread` and `tdmsblocks` use it to read samples on demand,
 so a file never has to be held in memory whole.
+
+The info of a stream (seekable, read from its current position) reads its samples
+from that stream, which must stay open while they are read.
 """
-function tdmsinfo(fn::AbstractString)
+tdmsinfo(fn::AbstractString) = open(s -> infostream(s, filesize(fn), String(fn), nothing), fn)
+tdmsinfo(io::IO) = infostream(io, streamend(io), "", io)
+
+function infostream(s::IO, fsize::Integer, path::String, io::Union{Nothing,IO})
     f=File()
     objdict=ObjDict()
     runs = OrderedDict{String,Vector{Run}}()
-    open(fn) do s
-        walksegments(s, filesize(fn), f, objdict) do datapos, nbytes, interleaved, incomplete
-            locateruns!(runs, objdict, datapos, nbytes, interleaved, incomplete)
-        end
+    walksegments(s, fsize, f, objdict) do datapos, nbytes, interleaved, incomplete
+        locateruns!(runs, objdict, datapos, nbytes, interleaved, incomplete)
     end
     channels = OrderedDict{Tuple{String,String},ChannelInfo}()
     for (g, grp) in f.groups, (c, ch) in grp.channels
@@ -177,8 +199,11 @@ function tdmsinfo(fn::AbstractString)
         starts = cumsum([1; [r.nvalues for r in rs]])
         channels[(g, c)] = ChannelInfo(eltype(ch.data), starts[end] - 1, ch.props, rs, starts[1:end-1])
     end
-    TDMSInfo(String(fn), f, channels)
+    TDMSInfo(path, f, channels, io)
 end
+
+"Call `f` with a stream to read the samples of `info` from: the stream it was read from, or its file, opened."
+withstream(f, info::TDMSInfo) = info.io === nothing ? open(f, info.path) : f(info.io)
 
 """
 Record where the values of the current segment's channels sit, chunk after chunk,
@@ -269,27 +294,27 @@ function addrun!(v::Vector{Run}, r::Run)
 end
 
 """
-    tdmsread(fn_or_info, group, channel, range) -> Vector
+    tdmsread(fn_or_io_or_info, group, channel, range) -> Vector
 
 Samples `range` (1-based, inclusive) of one channel, read from disk on demand. Any
 part of the range outside `1:nsamples` is a `BoundsError` -- nothing is clipped
 silently. Pass the `TDMSInfo` from `tdmsinfo` instead of the path to skip the
 metadata walk.
 """
-function tdmsread(x::Union{AbstractString,TDMSInfo}, group, channel, r::AbstractUnitRange{<:Integer})
+function tdmsread(x::Union{AbstractString,IO,TDMSInfo}, group, channel, r::AbstractUnitRange{<:Integer})
     info = x isa TDMSInfo ? x : tdmsinfo(x)
     ci = info[group, channel]
     checkbounds(Bool, 1:ci.nsamples, r) || throw(BoundsError(1:ci.nsamples, r))
     out = Vector{ci.eltype}(undef, length(r))
     isempty(r) && return out
-    open(info.path) do s
+    withstream(info) do s
         readrange!(out, 1, s, ci, first(r), length(r))
     end
     out
 end
 
 """
-    tdmsblocks(f, fn_or_info, group, channel; blocksize = 2^20, memory = nothing) -> nsamples
+    tdmsblocks(f, fn_or_io_or_info, group, channel; blocksize = 2^20, memory = nothing) -> nsamples
 
 Call `f(x, offset)` for consecutive blocks of one channel, `offset` being the
 0-based index of the block's first sample. One buffer is reused between calls;
@@ -298,7 +323,7 @@ the last block is short, never padded. `memory` is a byte budget for that buffer
 single value is an `ArgumentError`, and so is a budget for a string channel, whose
 values have no fixed size.
 """
-function tdmsblocks(f::Function, x::Union{AbstractString,TDMSInfo}, group, channel;
+function tdmsblocks(f::Function, x::Union{AbstractString,IO,TDMSInfo}, group, channel;
                     blocksize::Integer = 2^20, memory::Union{Nothing,Integer} = nothing)
     info = x isa TDMSInfo ? x : tdmsinfo(x)
     ci = info[group, channel]
@@ -311,7 +336,7 @@ function tdmsblocks(f::Function, x::Union{AbstractString,TDMSInfo}, group, chann
         blocksize = min(blocksize, cap)
     end
     buf = Vector{ci.eltype}(undef, min(blocksize, ci.nsamples))
-    open(info.path) do s
+    withstream(info) do s
         done = 0
         while done < ci.nsamples
             n = min(blocksize, ci.nsamples - done)

@@ -189,12 +189,14 @@ end
 `tdmsinfo(path)`: the `File` (properties, groups, channels -- with EMPTY data
 vectors) plus, per `(group, channel)`, a `ChannelInfo` giving the element type,
 the sample count the file actually holds, and where its values live. Index it
-like a `File`: `info["Group", "Channel1"]` or `info[1, 1]`.
+like a `File`: `info["Group", "Channel1"]` or `info[1, 1]`. The info of a stream has
+an empty `path` and keeps the stream, `io`, to read the samples from.
 """
 struct TDMSInfo
     path::String
     file::File
     channels::OrderedDict{Tuple{String,String},ChannelInfo}
+    io::Union{Nothing,IO}
 end
 Base.keys(i::TDMSInfo) = keys(i.channels)
 Base.getindex(i::TDMSInfo, group::AbstractString, channel::AbstractString) = i.channels[(String(group), String(channel))]
