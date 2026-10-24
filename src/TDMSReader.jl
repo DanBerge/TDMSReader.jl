@@ -703,4 +703,6 @@ function hexstring(x::Integer)
     "0x$(lpad(string(x,base=16),8,'0'))"
 end
 
+include("workload.jl")
+
 end # module
