@@ -1,3 +1,4 @@
+import Dates
 import Dates: Nanosecond, Second
 import TimesDates: TimeDate
 import Base: ==
@@ -32,6 +33,11 @@ function Base.:-(x::T,y::T) where {T<:TimeStamp}
 end
 Base.show(io::IO,ts::TimeStamp) = show(io,TimeDate(ts))
 Base.show(ts::TimeStamp) = show(TimeDate(ts))
+
+"A `DateTime` holds milliseconds: the time stamp is rounded down to the millisecond. `TimeDate(ts)` keeps nanoseconds."
+Dates.DateTime(x::TimeStamp) =
+    Dates.DateTime(1904, 1, 1) + Second(x.seconds) + Dates.Millisecond(floor(Int64, x.fractions * (2.0^-64) * 1e3))
+Base.isless(x::TimeStamp, y::TimeStamp) = isless((x.seconds, x.fractions), (y.seconds, y.fractions))
 
 
 function Base.:read(s::IO, ::Type{TimeStamp})

@@ -74,6 +74,22 @@ function readstream(s::IO, fsize::Integer, name::AbstractString, memory::Integer
 end
 
 """
+    TDMSReader.timeaxis(ch) -> range
+
+The time of each sample of a waveform channel, in seconds from its `wf_start_time`:
+`wf_start_offset + (i - 1) * wf_increment` for sample `i`, from the properties LabVIEW
+writes. `ch` is a `Channel` or a `ChannelInfo`. A channel without `wf_increment` is an
+`ArgumentError`; `wf_start_offset` defaults to 0.
+"""
+timeaxis(ch::Channel) = timeaxis(ch.props, length(ch.data))
+timeaxis(ci::ChannelInfo) = timeaxis(ci.props, ci.nsamples)
+function timeaxis(props::AbstractDict, n::Integer)
+    haskey(props, "wf_increment") ||
+        throw(ArgumentError("the channel has no wf_increment property, so it has no time axis"))
+    range(Float64(get(props, "wf_start_offset", 0.0)); step = Float64(props["wf_increment"]), length = n)
+end
+
+"""
 Walk the segments of an open file: read each lead-in and its meta data into `f` and
 `objdict`, and call `ondata(datapos, nbytes, interleaved, incomplete)` for each segment
 that holds raw data. A segment is `incomplete` when the file was never closed (LabVIEW
@@ -294,18 +310,30 @@ function addrun!(v::Vector{Run}, r::Run)
 end
 
 """
-    tdmsread(fn_or_io_or_info, group, channel, range) -> Vector
+    tdmsread([T,] fn_or_io_or_info, group, channel, range) -> Vector
 
 Samples `range` (1-based, inclusive) of one channel, read from disk on demand. Any
 part of the range outside `1:nsamples` is a `BoundsError` -- nothing is clipped
 silently. Pass the `TDMSInfo` from `tdmsinfo` instead of the path to skip the
 metadata walk.
+
+The element type is known only once the file is read, so the compiler cannot infer
+what `tdmsread(info, ...)` returns. Name it, `tdmsread(Float64, info, ...)`, and the
+result is inferred as `Vector{Float64}`; a channel of any other type is an
+`ArgumentError`.
 """
 function tdmsread(x::Union{AbstractString,IO,TDMSInfo}, group, channel, r::AbstractUnitRange{<:Integer})
     info = x isa TDMSInfo ? x : tdmsinfo(x)
+    tdmsread(info[group, channel].eltype, info, group, channel, r)
+end
+
+function tdmsread(::Type{T}, x::Union{AbstractString,IO,TDMSInfo}, group, channel,
+                  r::AbstractUnitRange{<:Integer}) where {T}
+    info = x isa TDMSInfo ? x : tdmsinfo(x)
     ci = info[group, channel]
+    ci.eltype === T || throw(ArgumentError("channel $(repr(group))/$(repr(channel)) holds $(ci.eltype), not $T"))
     checkbounds(Bool, 1:ci.nsamples, r) || throw(BoundsError(1:ci.nsamples, r))
-    out = Vector{ci.eltype}(undef, length(r))
+    out = Vector{T}(undef, length(r))
     isempty(r) && return out
     withstream(info) do s
         readrange!(out, 1, s, ci, first(r), length(r))
