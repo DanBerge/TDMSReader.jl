@@ -35,3 +35,19 @@ jobs:
           disable_search: true
           use_oidc: true
           fail_ci_if_error: false
+
+  # The tests against the oldest versions the compat entries allow, weak dependencies
+  # included, on the oldest Julia: the matrix above tests only the newest.
+  downgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.9'
+      - uses: julia-actions/julia-downgrade-compat@v2
+        with:
+          mode: alldeps
+          julia_version: '1.9'
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
