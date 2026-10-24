@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        julia-version: ['1.9', 'lts', '1']
+        julia-version: ['min', '1']      # the oldest Julia the compat entry allows, and the newest
         os: [ubuntu-latest, windows-latest, macOS-latest]
 
     steps:
@@ -44,10 +44,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1.9'
+          version: 'min'
       - uses: julia-actions/julia-downgrade-compat@v2
         with:
           mode: alldeps
-          julia_version: '1.9'
+          julia_version: 'min'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
