@@ -954,3 +954,5 @@ end
     @test TDMSReader.timeaxis(tdmsinfo(p)["G", "w"]) == t
     @test_throws ArgumentError TDMSReader.timeaxis(readtdms(p)["G", "n"])
 end
+
+include("extensions.jl")

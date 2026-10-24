@@ -90,6 +90,22 @@ function timeaxis(props::AbstractDict, n::Integer)
 end
 
 """
+    TDMSReader.withunits(ch, [unit]) -> Vector of quantities
+
+The samples of a channel as Unitful quantities: in `unit`, or else in the unit its
+`unit_string` property names, read by `Unitful.uparse`. A unit string Unitful does not
+read (LabVIEW's `"Volts"`, say) is an `ArgumentError`; give the unit instead. Needs
+`using Unitful`, which loads its methods.
+"""
+function withunits end
+
+"""
+The loader FileIO calls for a TDMS file: `FileIO.load("x.tdms"; kwargs...)` is
+`readtdms("x.tdms"; kwargs...)`, and the same for a stream. Its methods load with FileIO.
+"""
+function fileio_load end
+
+"""
 Walk the segments of an open file: read each lead-in and its meta data into `f` and
 `objdict`, and call `ondata(datapos, nbytes, interleaved, incomplete)` for each segment
 that holds raw data. A segment is `incomplete` when the file was never closed (LabVIEW
