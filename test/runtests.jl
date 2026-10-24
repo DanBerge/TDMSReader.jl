@@ -919,3 +919,38 @@ end
     @test tdmsread(tdmsinfo(io), "G", "a", 1:3) == Int16[1, 2, 3]
     @test occursin("the stream", try readtdms(IOBuffer(bytes); memory = 1) catch e; e.msg end)
 end
+
+@testset "a read that names the element type is inferred" begin
+    p = joinpath(mktempdir(), "typed.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/'G'/'a'", Int16, 3, []), ("/'G'/'b'", Float64, 3, [])],
+                     vcat(reinterpret(UInt8, Int16[1, 2, 3]), reinterpret(UInt8, [0.5, 1.5, 2.5])))
+    end
+    info = tdmsinfo(p)
+    @test (@inferred tdmsread(Float64, info, "G", "b", 1:3)) == [0.5, 1.5, 2.5]
+    @test (@inferred tdmsread(Int16, p, "G", "a", 2:3)) == Int16[2, 3]
+    @test tdmsread(Int16, info, "G", "a", 1:0) == Int16[]
+    @test tdmsread(info, "G", "b", 2:2) == [1.5]                 # untyped, as before
+    @test_throws ArgumentError tdmsread(Float32, info, "G", "b", 1:3)
+    @test_throws BoundsError tdmsread(Float64, info, "G", "b", 1:4)
+end
+
+@testset "time stamps convert and order; a waveform has a time axis" begin
+    a = TDMSReader.TimeStamp(3744278548, 0x8000000000000000)       # half a second past
+    b = TDMSReader.TimeStamp(3744278548, 0x0000000000000001)
+    @test TDMSReader.Dates.DateTime(a) == TDMSReader.Dates.DateTime(TDMSReader.TimeDate(a))
+    @test TDMSReader.Dates.DateTime(a) - TDMSReader.Dates.DateTime(b) == TDMSReader.Dates.Millisecond(500)
+    @test TDMSReader.Dates.DateTime(TDMSReader.TimeStamp(0, 0)) == TDMSReader.Dates.DateTime(1904, 1, 1)
+    @test b < a && sort([a, b]) == [b, a] && maximum([b, a]) == a
+    @test TDMSReader.TimeStamp(1, 0) > TDMSReader.TimeStamp(0, typemax(UInt64))
+
+    p = joinpath(mktempdir(), "waveform.tdms")
+    open(p, "w") do io
+        props = ["wf_increment" => (Float64, reinterpret(UInt8, [1e-3])), "wf_start_offset" => (Float64, reinterpret(UInt8, [2.0]))]
+        tdms_segment(io, [("/'G'/'w'", Int16, 4, props), ("/'G'/'n'", Int16, 1, [])], reinterpret(UInt8, Int16[1, 2, 3, 4, 5]))
+    end
+    t = TDMSReader.timeaxis(readtdms(p)["G", "w"])
+    @test length(t) == 4 && t[1] == 2.0 && t[end] ≈ 2.003
+    @test TDMSReader.timeaxis(tdmsinfo(p)["G", "w"]) == t
+    @test_throws ArgumentError TDMSReader.timeaxis(readtdms(p)["G", "n"])
+end

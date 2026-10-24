@@ -40,12 +40,24 @@ no fixed size, so a string channel takes `blocksize` only.
 `TDMSReader.databytes(info)` is the number of bytes `readtdms` would allocate
 (for a string, its text and 16 bytes more, as `Base.summarysize` counts it).
 
+`tdmsread(Float64, info, "Group", "Channel1", r)` names the element type, so the
+result is inferred as `Vector{Float64}` (an `ArgumentError` for a channel of another
+type); without it, code that loops over the samples is fastest behind a function
+barrier.
+
 ## Reading from a stream
 
 `readtdms`, `tdmsinfo`, `tdmsread` and `tdmsblocks` also take a seekable stream (an
 `IOStream` or `IOBuffer`) in place of the path, and read the file from the stream's
 position to its end: `readtdms(IOBuffer(bytes))`. The info of a stream reads its
 samples from that stream, which must stay open.
+
+## Time
+
+A `TimeStamp` converts with `DateTime(t)` (milliseconds) or `TimeDate(t)`
+(nanoseconds), and orders with `<`, `sort` and `maximum`. `TDMSReader.timeaxis(ch)`
+is the time of each sample of a waveform channel in seconds, from its
+`wf_start_offset` and `wf_increment`.
 
 ## What it reads
 
