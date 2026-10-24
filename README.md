@@ -40,6 +40,13 @@ no fixed size, so a string channel takes `blocksize` only.
 `TDMSReader.databytes(info)` is the number of bytes `readtdms` would allocate
 (for a string, its text and 16 bytes more, as `Base.summarysize` counts it).
 
+## Reading from a stream
+
+`readtdms`, `tdmsinfo`, `tdmsread` and `tdmsblocks` also take a seekable stream (an
+`IOStream` or `IOBuffer`) in place of the path, and read the file from the stream's
+position to its end: `readtdms(IOBuffer(bytes))`. The info of a stream reads its
+samples from that stream, which must stay open.
+
 ## What it reads
 
 - TDMS 1.0 and 2.0 files (versions 4712 and 4713), little-endian

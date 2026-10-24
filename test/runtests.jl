@@ -894,3 +894,28 @@ end
     @test isempty(bad)
     isempty(bad) || foreach(x -> @info(x), bad[1:min(10, end)])
 end
+
+@testset "a file is read from a stream as from its path" begin
+    p = joinpath(mktempdir(), "stream.tdms")
+    open(p, "w") do io
+        objs = [("/", nothing, 0, ["name" => "stream"]), ("/'G'", nothing, 0, []), ("/'G'/'a'", Int16, 3, []),
+                ("/'G'/'b'", Float64, 3, []), ("/'H'", nothing, 0, []), ("/'H'/'s'", String, ["x", "yy"], [])]
+        tdms_segment(io, objs, vcat(reinterpret(UInt8, Int16[1, 2, 3]), reinterpret(UInt8, [0.5, 1.5, 2.5]),
+                                    tdms_strings(["x", "yy"])))
+    end
+    bytes = read(p)
+    @test readtdms(IOBuffer(bytes)) == readtdms(p)
+    @test open(readtdms, p) == readtdms(p)
+    io = IOBuffer(vcat(b"junk!", bytes)); skip(io, 5)      # read from the stream's position
+    @test readtdms(io) == readtdms(p)
+
+    info = tdmsinfo(IOBuffer(bytes))
+    @test info.io isa IOBuffer && info.path == "" && collect(keys(info)) == collect(keys(tdmsinfo(p)))
+    @test tdmsread(info, "G", "b", 2:3) == [1.5, 2.5]
+    @test tdmsread(IOBuffer(bytes), "H", "s", 1:2) == ["x", "yy"]
+    got = Int16[]
+    @test tdmsblocks((x, _) -> append!(got, x), IOBuffer(bytes), "G", "a"; blocksize = 2) == 3 && got == Int16[1, 2, 3]
+    io = IOBuffer(vcat(b"junk!", bytes)); skip(io, 5)
+    @test tdmsread(tdmsinfo(io), "G", "a", 1:3) == Int16[1, 2, 3]
+    @test occursin("the stream", try readtdms(IOBuffer(bytes); memory = 1) catch e; e.msg end)
+end
