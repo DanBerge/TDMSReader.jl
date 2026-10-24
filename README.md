@@ -59,6 +59,17 @@ A `TimeStamp` converts with `DateTime(t)` (milliseconds) or `TimeDate(t)`
 is the time of each sample of a waveform channel in seconds, from its
 `wf_start_offset` and `wf_increment`.
 
+## With other packages
+
+These load only beside the package they name (Julia 1.9 package extensions):
+
+- **Tables.jl**: a group whose channels are the same length is a table, so
+  `DataFrame(f["Group"])` works.
+- **Unitful**: `TDMSReader.withunits(ch)` gives the samples in the unit its
+  `unit_string` names, or `withunits(ch, u"V")` for a unit Unitful does not read.
+- **FileIO**: `load("measurement.tdms")` calls `readtdms`, once TDMS is in FileIO's
+  registry.
+
 ## What it reads
 
 - TDMS 1.0 and 2.0 files (versions 4712 and 4713), little-endian
