@@ -121,8 +121,7 @@ lengths, and versions other than 4712 and 4713.
   ranges that read nothing, and reads inside a `tdmsblocks` callback give a clear
   error or the right result.
 - **CI** runs the tests on Julia 1.10 (the oldest supported) and the current release,
-  on Linux, Windows and macOS, and once more with every dependency at the oldest
-  version its compat entry allows.
+  on Linux, Windows and macOS.
 
 The comparisons run outside the test suite; each problem they found has a test of
 its own.
