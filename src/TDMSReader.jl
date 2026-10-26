@@ -43,8 +43,13 @@ readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory())) =
     open(s -> readstream(s, filesize(fn), repr(basename(fn)), memory), fn)
 readtdms(io::IO; memory::Integer = Int(Sys.free_memory())) = readstream(io, streamend(io), "the stream", memory)
 
-"The position of the end of a seekable stream; the stream is left where it was."
+"""
+The position of the end of a seekable stream; the stream is left where it was. A stream
+closed, or open only for writing, is an `ArgumentError`: it would otherwise read as an
+empty file, or fail with an error about the file descriptor rather than the call.
+"""
 function streamend(io::IO)
+    isopen(io) && isreadable(io) || throw(ArgumentError("the stream is not open for reading"))
     p = position(io)
     seekend(io)
     e = position(io)
@@ -369,6 +374,7 @@ values have no fixed size.
 """
 function tdmsblocks(f::Function, x::Union{AbstractString,IO,TDMSInfo}, group, channel;
                     blocksize::Integer = 2^20, memory::Union{Nothing,Integer} = nothing)
+    blocksize >= 1 || throw(ArgumentError("blocksize must be at least 1, not $blocksize"))
     info = x isa TDMSInfo ? x : tdmsinfo(x)
     ci = info[group, channel]
     ci.nsamples == 0 && return 0

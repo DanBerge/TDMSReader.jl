@@ -961,3 +961,6 @@ include("extensions.jl")
     import Aqua
     Aqua.test_all(TDMSReader)
 end
+
+include("misuse.jl")
+include("stress.jl")

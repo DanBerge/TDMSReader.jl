@@ -123,6 +123,11 @@ Base.:getkey(h::File, key, default)=getkey(h.groups, key, default)
 Base.:keys(a::File)=keys(a.groups)
 ==(a::File,b::File) = (a.props == b.props) && (a.groups == b.groups)
 
+# hashes that agree with ==, so equal files, groups and channels are one key of a Dict or Set
+Base.hash(a::Channel, h::UInt) = hash(a.data, hash(a.props, hash(:TDMSReaderChannel, h)))
+Base.hash(a::Group, h::UInt) = hash(a.channels, hash(a.props, hash(:TDMSReaderGroup, h)))
+Base.hash(a::File, h::UInt) = hash(a.groups, hash(a.props, hash(:TDMSReaderFile, h)))
+
 """
 How one channel's values sit in each chunk of the current segment: `nsamples` values in
 `nbytes` bytes -- `nsamples` times the element size, or for a string channel the total
