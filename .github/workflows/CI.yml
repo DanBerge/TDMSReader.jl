@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        julia-version: ['1.9', 'lts', '1']
+        julia-version: ['min', '1']      # the oldest Julia the compat entry allows, and the newest
         os: [ubuntu-latest, windows-latest, macOS-latest]
 
     steps:

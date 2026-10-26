@@ -956,3 +956,8 @@ end
 end
 
 include("extensions.jl")
+
+@testset "Aqua: ambiguities, piracy, stale dependencies, compat bounds" begin
+    import Aqua
+    Aqua.test_all(TDMSReader)
+end

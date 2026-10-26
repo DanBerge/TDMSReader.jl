@@ -113,8 +113,8 @@ lengths, and versions other than 4712 and 4713.
   takes more than 5 s.
 - **Real captures.** 97 LabVIEW captures, 1 KB to 8.6 GB, read identically by
   npTDMS and this package.
-- **CI** runs the tests on Julia 1.9, the LTS and the current release, on Linux,
-  Windows and macOS.
+- **CI** runs the tests on Julia 1.10 (the oldest supported) and the current release,
+  on Linux, Windows and macOS.
 
 The comparisons run outside the test suite; each problem they found has a test of
 its own.
