@@ -39,10 +39,12 @@ function check_long(p, n; whole = true)
     @test_throws ErrorException readtdms(p; memory = 2n - 1)       # refused before it allocates
     @test least_alloc(() -> try readtdms(p; memory = 2n - 1) catch end) < 100_000
     if whole
-        x = readtdms(p)["G", "x"].data
+        # a budget given, not the default free memory: macOS counts its file cache as used,
+        # and a CI runner reported less than 100 MB free
+        x = readtdms(p; memory = 4n)["G", "x"].data
         @test length(x) == n && all(k -> x[k] == stresscode(k), 1:n)
         x = nothing
-        @test least_alloc(() -> readtdms(p)) < 2n + (1 << 20)       # the data once
+        @test least_alloc(() -> readtdms(p; memory = 4n)) < 2n + (1 << 20)       # the data once
     end
 end
 
@@ -65,7 +67,7 @@ end
     info = tdmsinfo(p)
     @test info["G", "x"].nsamples == nseg * m && length(info["G", "x"].runs) == nseg
     @test tdmsread(info, "G", "x", (m - 1):(m + 2)) == stresscode.((m - 1):(m + 2))   # across a segment boundary
-    @test readtdms(p)["G", "x"].data == stresscode.(1:nseg * m)
+    @test readtdms(p; memory = 4nseg * m)["G", "x"].data == stresscode.(1:nseg * m)
     rm(p)
 end
 
